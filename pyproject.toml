@@ -1,0 +1,7 @@
+[project]
+name = "rkn-bot-telegram"
+version = "0.1.0"
+description = "Telegram bot for VPN subscription management via 3x-ui."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
