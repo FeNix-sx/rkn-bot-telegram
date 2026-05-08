@@ -15,6 +15,7 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class Settings:
+    """Runtime settings validated from environment variables."""
     bot_token: str
     xui_api_url: str
     xui_username: str
@@ -54,7 +55,6 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
     _load_dotenv_file(Path(env_file))
     missing = [n for n in REQUIRED_ENV_VARS if not os.getenv(n, "").strip()]
     if missing: raise ConfigError(f"Missing required env var(s): {', '.join(missing)}.")
-
     return Settings(
         bot_token=_require_non_empty("BOT_TOKEN"),
         xui_api_url=_require_non_empty("XUI_API_URL"),
