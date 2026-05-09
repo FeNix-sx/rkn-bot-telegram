@@ -19,6 +19,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Привязанные", callback_data="admin:bound")],
         [InlineKeyboardButton(text="🔗 Непривязанные", callback_data="admin:unbound")],
+        [InlineKeyboardButton(text="❓ Не в базе", callback_data="admin:unknown")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="stats:back")],
     ])
 

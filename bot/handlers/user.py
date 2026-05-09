@@ -1,14 +1,17 @@
 from __future__ import annotations
+import os
+import logging
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
 from aiogram import Router, F, Bot
 from aiogram.types import Message
 from aiogram.filters import Command
-from bot.keyboards import reply_menu
+
 from core.config import Settings
 from core.xui_api import XUIAPI
 from db.repositories.users_repo import UsersRepository
-from datetime import datetime, timedelta, timezone
-from uuid import uuid4
-import os, logging
+from bot.keyboards import reply_menu
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
@@ -17,11 +20,6 @@ def _fmt(dt):
     if not dt: return "n/a"
     try: return datetime.fromisoformat(dt).strftime("%Y-%m-%d %H:%M:%S UTC")
     except: return "n/a"
-
-async def _adm(tg_id: int, data: dict) -> bool:
-    s = data["settings"]
-    r = data["users_repo"]
-    return tg_id in s.admin_ids or await r.is_admin(tg_id)
 
 @router.message(Command("start"))
 async def start(msg: Message, settings: Settings, users_repo: UsersRepository, bot: Bot):
@@ -50,34 +48,34 @@ async def status(msg: Message, settings: Settings, users_repo: UsersRepository):
     await msg.answer(f"Статус:\n- status: {row.get('status','new')}\n- trial_used: {'yes' if row.get('has_trial_used') else 'no'}\n- end: {_fmt(row.get('trial_end'))}\n- link: {'yes' if row.get('subscription_url') else 'no'}", reply_markup=reply_menu(is_adm))
 
 @router.message(Command("link"), F.text == "🔗 Моя ссылка")
-async def link(msg: Message, data: dict):
+async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
     tg = msg.from_user
     if not tg: return
-    row = await data["users_repo"].get_user(tg.id)
+    row = await users_repo.get_user(tg.id)
     if not row: return await msg.answer("Ошибка.", reply_markup=reply_menu())
     url = (row.get("subscription_url") or "").strip()
     if not url: return await msg.answer("Нет ссылки. Запусти /trial.", reply_markup=reply_menu())
-    await msg.answer(f"Твоя ссылка: {url}", reply_markup=reply_menu(await _adm(tg.id, data)))
+    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
+    await msg.answer(f"Твоя ссылка: {url}", reply_markup=reply_menu(is_adm))
 
 @router.message(Command("trial"), F.text == "🚀 Получить триал")
-async def trial(msg: Message, data: dict):
+async def trial(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     tg = msg.from_user
     if not tg: return
-    r, xui, s = data["users_repo"], data["xui_api"], data["settings"]
-    row = await r.get_user(tg.id)
+    row = await users_repo.get_user(tg.id)
     if not row or row.get("has_trial_used"): return await msg.answer("Триал уже использован.", reply_markup=reply_menu())
-    start = datetime.now(timezone.utc)
-    end = start + timedelta(days=s.trial_days)
+    start_t = datetime.now(timezone.utc)
+    end_t = start_t + timedelta(days=settings.trial_days)
     email = f"trial_{tg.id}"
-    uuid = str(uuid4())
+    uuid_val = str(uuid4())
     if os.getenv("MOCK_XUI"):
-        await r.set_trial(tg.id, start.isoformat(), end.isoformat(), email, uuid, f"mock://sub/{email}")
+        await users_repo.set_trial(tg.id, start_t.isoformat(), end_t.isoformat(), email, uuid_val, f"mock://sub/{email}")
         return await msg.answer(f"✅ MOCK: {email}", reply_markup=reply_menu())
     try:
-        iid = await xui.resolve_inbound_id("vless_reality")
-        await xui.add_client(iid, email, uuid, limit_ip=1)
-        sub = await xui.build_or_get_subscription_url(inbound_id=iid, email=email)
-        await r.set_trial(tg.id, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"), email, uuid, sub)
+        iid = await xui_api.resolve_inbound_id("vless_reality")
+        await xui_api.add_client(iid, email, uuid_val, limit_ip=1)
+        sub = await xui_api.build_or_get_subscription_url(inbound_id=iid, email=email)
+        await users_repo.set_trial(tg.id, start_t.isoformat(timespec="seconds"), end_t.isoformat(timespec="seconds"), email, uuid_val, sub)
         await msg.answer(f"Триал активирован: {sub}", reply_markup=reply_menu())
     except Exception as e:
         await msg.answer(f"Ошибка: {e}", reply_markup=reply_menu())
