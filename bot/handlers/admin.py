@@ -116,6 +116,14 @@ async def admin_main_cb(cb: CallbackQuery, settings: Settings, users_repo: Users
     await cb.answer()
     await cb.message.answer("⚙️ Управление:", reply_markup=admin_menu())
 
+
+@router.callback_query(F.data == "admin:panel_back")
+async def admin_panel_back(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    await cb.answer()
+    await cb.message.answer("Главное меню:", reply_markup=reply_menu(True))
+
 @router.callback_query((F.data == "admin:bound") | F.data.startswith("admin:bound:page:"))
 async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
@@ -189,8 +197,8 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
             [InlineKeyboardButton(text="📅 Продлить подписку", callback_data=f"bound:renew:start:{tg_id}:{list_page}")],
             [InlineKeyboardButton(text="📶 Количество подключений (IP limit)", callback_data=f"bound:iplimit:menu:{tg_id}:{list_page}")],
             [
-                InlineKeyboardButton(text="👑 Сделать админом", callback_data=f"bound:stub:grant_admin:{tg_id}"),
-                InlineKeyboardButton(text="🚫 Убрать админа", callback_data=f"bound:stub:revoke_admin:{tg_id}"),
+                InlineKeyboardButton(text="👑 Сделать админом", callback_data=f"bound:grant_admin:ask:{tg_id}:{list_page}"),
+                InlineKeyboardButton(text="🚫 Убрать админа", callback_data=f"bound:revoke_admin:ask:{tg_id}:{list_page}"),
             ],
             [
                 InlineKeyboardButton(text="⏸ Отключить", callback_data=f"bound:stub:disable:{tg_id}"),
@@ -373,9 +381,142 @@ async def bound_renew_manual_date(
     )
 
 
+def _back_to_bound_user_kb(tg_id: int, list_page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")]
+        ]
+    )
+
+
+@router.callback_query(F.data.startswith("bound:grant_admin:"))
+async def bound_grant_admin_flow(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    action, tg_id, list_page = parts[2], int(parts[3]), int(parts[4])
+
+    async def _already_admin(tid: int) -> bool:
+        return tid in settings.admin_ids or await users_repo.is_admin(tid)
+
+    if action == "ask":
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+        if await _already_admin(tg_id):
+            return await cb.message.answer(
+                "ℹ️ У этого пользователя уже есть права администратора.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        label = _btn_user_label(row.get("username"), tg_id, max_len=36)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Да", callback_data=f"bound:grant_admin:yes:{tg_id}:{list_page}"),
+                    InlineKeyboardButton(text="❌ Нет", callback_data=f"bound:grant_admin:no:{tg_id}:{list_page}"),
+                ],
+                [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
+            ]
+        )
+        return await cb.message.answer(
+            f"Выдать пользователю «{label}» (id: {tg_id}) права администратора в боте?",
+            reply_markup=kb,
+        )
+
+    if action == "yes":
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+        if await _already_admin(tg_id):
+            return await cb.message.answer(
+                "ℹ️ Уже администратор, изменения не требуются.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        await users_repo.set_admin(tg_id, True)
+        return await cb.message.answer(
+            "✅ Пользователю выданы права администратора.",
+            reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+        )
+
+    if action == "no":
+        await cb.answer("Отменено")
+        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bound:revoke_admin:"))
+async def bound_revoke_admin_flow(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    action, tg_id, list_page = parts[2], int(parts[3]), int(parts[4])
+
+    if action == "ask":
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+        if tg_id in settings.admin_ids:
+            return await cb.message.answer(
+                "⚠️ Этот ID указан в ADMIN_IDS в конфиге бота. Снять такие права можно только убрав id из конфига и перезапустив бота.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        if not await users_repo.is_admin(tg_id):
+            return await cb.message.answer(
+                "ℹ️ У пользователя нет прав администратора в базе.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        label = _btn_user_label(row.get("username"), tg_id, max_len=36)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Да", callback_data=f"bound:revoke_admin:yes:{tg_id}:{list_page}"),
+                    InlineKeyboardButton(text="❌ Нет", callback_data=f"bound:revoke_admin:no:{tg_id}:{list_page}"),
+                ],
+                [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
+            ]
+        )
+        return await cb.message.answer(
+            f"Снять у пользователя «{label}» (id: {tg_id}) права администратора в боте (запись в БД)?",
+            reply_markup=kb,
+        )
+
+    if action == "yes":
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+        if tg_id in settings.admin_ids:
+            return await cb.message.answer(
+                "⚠️ ID в ADMIN_IDS — снятие через бота невозможно, правь конфиг.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        if not await users_repo.is_admin(tg_id):
+            return await cb.message.answer(
+                "ℹ️ Уже без прав администратора в БД.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        await users_repo.set_admin(tg_id, False)
+        return await cb.message.answer(
+            "✅ Права администратора в базе сняты.",
+            reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+        )
+
+    if action == "no":
+        await cb.answer("Отменено")
+        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
 _STUB_LABELS = {
-    "grant_admin": "Сделать админом",
-    "revoke_admin": "Убрать админа",
     "disable": "Отключить клиента в панели",
     "enable": "Включить клиента в панели",
     "delete": "Удалить полностью (БД + 3X-UI)",

@@ -12,6 +12,7 @@ from core.config import Settings
 from core.xui_api import XUIAPI
 from db.repositories.users_repo import UsersRepository
 from bot.keyboards import reply_menu
+from bot.handlers.stats import show_personal_stats
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
@@ -73,16 +74,15 @@ async def start(msg: Message, settings: Settings, users_repo: UsersRepository, b
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
     await msg.answer(f"{'Привет! Профиль создан.' if row else 'С возвращением!'}\nСтатус: {st}\n\n/trial - триал\n/status - статус\n/link - ссылка", reply_markup=reply_menu(is_adm))
 
-@router.message(Command("status"), F.text == "📊 Мой статус")
-async def status(msg: Message, settings: Settings, users_repo: UsersRepository):
+@router.message(Command("status"))
+@router.message(F.text == "📊 Мой статус")
+async def status(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     tg = msg.from_user
     if not tg: return
-    row = await users_repo.get_user(tg.id)
-    if not row: return await msg.answer("Ошибка загрузки.", reply_markup=reply_menu())
-    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
-    await msg.answer(f"Статус:\n- status: {row.get('status','new')}\n- trial_used: {'yes' if row.get('has_trial_used') else 'no'}\n- end: {_fmt(row.get('trial_end'))}\n- link: {'yes' if row.get('subscription_url') else 'no'}", reply_markup=reply_menu(is_adm))
+    await show_personal_stats(msg, tg.id, settings, users_repo, xui_api)
 
-@router.message(Command("link"), F.text == "🔗 Моя ссылка")
+@router.message(Command("link"))
+@router.message(F.text == "🔗 Моя ссылка")
 async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
     tg = msg.from_user
     if not tg: return
@@ -93,7 +93,8 @@ async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
     await msg.answer(f"Твоя ссылка: {url}", reply_markup=reply_menu(is_adm))
 
-@router.message(Command("trial"), F.text == "🚀 Получить триал")
+@router.message(Command("trial"))
+@router.message(F.text == "🚀 Получить триал")
 async def cmd_trial(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI, bot: Bot):
     tg = msg.from_user
     if not tg: return

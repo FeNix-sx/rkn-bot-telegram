@@ -6,13 +6,23 @@ from datetime import datetime, timezone
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
-from bot.keyboards import reply_menu, stats_menu, back_admin
+from bot.keyboards import reply_menu, back_admin
 from core.xui_api import XUIAPI
 from core.config import Settings
 from db.repositories.users_repo import UsersRepository
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
+
+
+def _role_label(tg_id: int, settings: Settings, row: dict | None) -> str:
+    """Админ из .env (admin_ids) или флаг is_admin в БД."""
+    if tg_id in settings.admin_ids:
+        return "Администратор"
+    if row and row.get("is_admin"):
+        return "Администратор"
+    return "Пользователь"
+
 
 def _gb(val: int | float) -> str:
     return f"{val / 1024**3:.2f} ГБ"
@@ -35,11 +45,20 @@ async def _get_client_info(xui_api: XUIAPI, email: str) -> dict:
         LOGGER.exception("xui.client_info.error")
     return {"limit_ip": 1, "enable": True, "expiry_ms": 0}
 
-def _format_stat_block(name: str | None, up: int, down: int, info: dict, show_name: bool = True) -> str:
+def _format_stat_block(
+    name: str | None,
+    up: int,
+    down: int,
+    info: dict,
+    show_name: bool = True,
+    role_label: str | None = None,
+) -> str:
     total = up + down
     lines = []
     if show_name and name:
         lines.append(f"👤 `{name}`")
+    if role_label:
+        lines.append(f"🔑 Полномочия: `{role_label}`")
     lines.append(f"📊 трафик: ↑{_gb(up)} ↓{_gb(down)} | {_gb(total)} общий")
     lines.append(f"🔗 подключений: `{info['limit_ip']}`")
     lines.append(f"📡 статус: {'✅ вкл' if info['enable'] else '❌ откл'}")
@@ -55,29 +74,37 @@ def _format_stat_block(name: str | None, up: int, down: int, info: dict, show_na
     return "\n".join(lines)
 
 @router.message(Command("stats"))
+async def stats_command(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+    tg = msg.from_user
+    if not tg: return
+    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
+    if is_adm:
+        await _render_admin_stats(msg, settings, xui_api)
+    else:
+        await show_personal_stats(msg, tg.id, settings, users_repo, xui_api)
+
+
 @router.message(F.text == "📈 Статистика")
-async def stats_menu_h(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def stats_reply_button(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     tg = msg.from_user
     if not tg: return
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
     if not is_adm:
-        await _show_personal_stats(msg, tg.id, settings, users_repo, xui_api)
+        await msg.answer("🚫 Нет доступа.", reply_markup=reply_menu(False))
         return
-    await msg.answer("📊 Статистика:", reply_markup=stats_menu(is_adm))
+    await _render_admin_stats(msg, settings, xui_api)
 
-@router.callback_query(F.data == "stats:my")
-async def my_stats(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
-    tg = cb.from_user
-    if not tg: return await cb.answer("Ошибка", show_alert=True)
-    await cb.answer()
-    await _show_personal_stats(cb.message, tg.id, settings, users_repo, xui_api)
-
-async def _show_personal_stats(msg: Message, tg_id: int, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     try:
         row = await users_repo.get_user(tg_id)
+        role = _role_label(tg_id, settings, row)
         if not row or not row.get("xui_email"):
             is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
-            return await msg.answer("🔍 Профиль не привязан к панели.", reply_markup=reply_menu(is_adm))
+            return await msg.answer(
+                f"🔍 Профиль не привязан к панели.\n🔑 Полномочия: `{role}`",
+                parse_mode="Markdown",
+                reply_markup=reply_menu(is_adm),
+            )
 
         email = row["xui_email"]
         inbounds = await xui_api.get_inbounds()
@@ -86,7 +113,7 @@ async def _show_personal_stats(msg: Message, tg_id: int, settings: Settings, use
         down = client_stats.get("down", 0) if client_stats else 0
         info = await _get_client_info(xui_api, email)
 
-        text = _format_stat_block(None, up, down, info, show_name=False)
+        text = _format_stat_block(None, up, down, info, show_name=False, role_label=role)
         is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
         await msg.answer(text, parse_mode="Markdown", reply_markup=reply_menu(is_adm))
     except Exception as e:
@@ -94,19 +121,12 @@ async def _show_personal_stats(msg: Message, tg_id: int, settings: Settings, use
         is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
         await msg.answer(f"❌ Ошибка: {type(e).__name__}", reply_markup=reply_menu(is_adm))
 
-@router.callback_query(F.data == "stats:all")
-async def all_stats(cb: CallbackQuery, settings: Settings, xui_api: XUIAPI):
-    tg = cb.from_user
-    if tg.id not in settings.admin_ids: return await cb.answer("🚫", show_alert=True)
-    await cb.answer()
-    await _render_admin_stats(cb.message, settings.db_path, xui_api)
-
-async def _render_admin_stats(msg: Message, db_path: str, xui_api: XUIAPI):
+async def _render_admin_stats(msg: Message, settings: Settings, xui_api: XUIAPI):
     try:
-        async with aiosqlite.connect(db_path) as db:
+        async with aiosqlite.connect(settings.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
-                SELECT tg_id, username, xui_email
+                SELECT tg_id, username, xui_email, is_admin
                 FROM users WHERE xui_email IS NOT NULL AND xui_email != '' ORDER BY tg_id
             """) as cur:
                 users = await cur.fetchall()
@@ -123,16 +143,12 @@ async def _render_admin_stats(msg: Message, db_path: str, xui_api: XUIAPI):
             down = st.get("down", 0) if st else 0
             info = await _get_client_info(xui_api, email)
             name = u["username"] or f"ID:{u['tg_id']}"
-            blocks.append(_format_stat_block(name, up, down, info, show_name=True))
+            rid = u["tg_id"]
+            role = _role_label(rid, settings, {k: u[k] for k in u.keys()})
+            blocks.append(_format_stat_block(name, up, down, info, show_name=True, role_label=role))
 
         text = "📊 Привязанные:\n\n" + "\n\n──────────────\n\n".join(blocks[:5])
         await msg.answer(text, parse_mode="Markdown", reply_markup=back_admin())
     except Exception as e:
         LOGGER.exception("stats.admin.error")
         await msg.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
-
-@router.callback_query(F.data == "stats:back")
-async def stats_back(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
-    await cb.answer()
-    is_adm = cb.from_user.id in settings.admin_ids or await users_repo.is_admin(cb.from_user.id)
-    await cb.message.answer("📊 Статистика:", reply_markup=stats_menu(is_adm))
