@@ -1,11 +1,11 @@
 from __future__ import annotations
-import os
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from aiogram import Router, F, Bot
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
 
 from core.config import Settings
@@ -16,10 +16,45 @@ from bot.keyboards import reply_menu
 LOGGER = logging.getLogger(__name__)
 router = Router()
 
+PENDING_TRIALS: dict[int, dict] = {}
+
 def _fmt(dt):
     if not dt: return "n/a"
     try: return datetime.fromisoformat(dt).strftime("%Y-%m-%d %H:%M:%S UTC")
     except: return "n/a"
+
+def _is_sub_active(row: dict | None) -> tuple[bool, str | None]:
+    if not row: return False, None
+    now = datetime.now(timezone.utc)
+    end_raw = row.get("paid_until") or row.get("trial_end")
+    if not end_raw: return False, None
+    try:
+        end_dt = datetime.fromisoformat(end_raw).replace(tzinfo=timezone.utc)
+        if end_dt > now: return True, end_raw
+    except: pass
+    return False, None
+
+async def _issue_trial_now(tg_id: int, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI) -> str:
+    start = datetime.now(timezone.utc)
+    end = start + timedelta(days=settings.trial_days)
+    email = f"trial_{tg_id}"
+    uuid_val = str(uuid4())
+    if os.getenv("MOCK_XUI"):
+        url = f"mock://sub/{email}"
+        await users_repo.set_trial(tg_id, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"), email, uuid_val, url)
+        return url
+    inbound_id = await xui_api.resolve_inbound_id("vless_reality")
+    await xui_api.add_client(inbound_id, email, uuid_val, limit_ip=1)
+    url = await xui_api.build_or_get_subscription_url(inbound_id=inbound_id, email=email)
+    await users_repo.set_trial(
+        tg_id,
+        start.isoformat(timespec="seconds"),
+        end.isoformat(timespec="seconds"),
+        email,
+        uuid_val,
+        url,
+    )
+    return url
 
 @router.message(Command("start"))
 async def start(msg: Message, settings: Settings, users_repo: UsersRepository, bot: Bot):
@@ -59,23 +94,24 @@ async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
     await msg.answer(f"Твоя ссылка: {url}", reply_markup=reply_menu(is_adm))
 
 @router.message(Command("trial"), F.text == "🚀 Получить триал")
-async def trial(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def cmd_trial(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI, bot: Bot):
     tg = msg.from_user
     if not tg: return
     row = await users_repo.get_user(tg.id)
-    if not row or row.get("has_trial_used"): return await msg.answer("Триал уже использован.", reply_markup=reply_menu())
-    start_t = datetime.now(timezone.utc)
-    end_t = start_t + timedelta(days=settings.trial_days)
-    email = f"trial_{tg.id}"
-    uuid_val = str(uuid4())
-    if os.getenv("MOCK_XUI"):
-        await users_repo.set_trial(tg.id, start_t.isoformat(), end_t.isoformat(), email, uuid_val, f"mock://sub/{email}")
-        return await msg.answer(f"✅ MOCK: {email}", reply_markup=reply_menu())
-    try:
-        iid = await xui_api.resolve_inbound_id("vless_reality")
-        await xui_api.add_client(iid, email, uuid_val, limit_ip=1)
-        sub = await xui_api.build_or_get_subscription_url(inbound_id=iid, email=email)
-        await users_repo.set_trial(tg.id, start_t.isoformat(timespec="seconds"), end_t.isoformat(timespec="seconds"), email, uuid_val, sub)
-        await msg.answer(f"Триал активирован: {sub}", reply_markup=reply_menu())
-    except Exception as e:
-        await msg.answer(f"Ошибка: {e}", reply_markup=reply_menu())
+    active, end_date = _is_sub_active(row)
+    if active:
+        await msg.answer(f"🚫 Подписка уже активирована.\n📅 Истекает: `{_fmt(end_date)}`", parse_mode="Markdown", reply_markup=reply_menu())
+        return
+    PENDING_TRIALS[tg.id] = {"username": tg.username, "first_name": tg.first_name}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Разрешить", callback_data=f"trial:approve:{tg.id}")],
+        [InlineKeyboardButton(text="❌ Запретить", callback_data=f"trial:deny:{tg.id}")]
+    ])
+    admins = set(settings.admin_ids)
+    admins.update(await users_repo.get_all_dynamic_admins())
+    name = tg.username or tg.first_name or f"ID:{tg.id}"
+    text = f"🆔 Запрос на триал:\n👤 {name}\n⏳ Ожидает решения..."
+    for aid in admins:
+        try: await bot.send_message(aid, text, reply_markup=kb)
+        except: pass
+    await msg.answer("⏳ Запрос отправлен администраторам. Ожидайте решения.")
