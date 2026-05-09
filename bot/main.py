@@ -4,6 +4,7 @@ import logging
 import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from core.config import ConfigError, load_settings
 from core.xui_api import XUIAPI
@@ -28,7 +29,7 @@ async def run(settings) -> None:
         LOGGER.warning("3X-UI offline: %s", e)
 
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=None))
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
 
     # Регистрация зависимостей для DI
     dp["settings"] = settings

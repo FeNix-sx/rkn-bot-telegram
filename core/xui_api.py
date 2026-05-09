@@ -1,5 +1,6 @@
 """Minimal async 3x-ui API client."""
 from __future__ import annotations
+import copy
 import json
 import logging
 from collections.abc import Mapping
@@ -116,15 +117,90 @@ class XUIAPI:
         }
         await self._request("POST", "/panel/api/inbounds/addClient", json_body=payload)
 
+    async def find_inbound_id_for_email(self, email: str) -> int:
+        target = (email or "").strip()
+        if not target:
+            raise XUIAPIError("Empty client email.")
+        for ib in await self.get_inbounds():
+            iid = ib.get("id")
+            if not isinstance(iid, int):
+                continue
+            s_raw = ib.get("settings")
+            clients: list[Any] = []
+            if isinstance(s_raw, str):
+                try:
+                    clients = json.loads(s_raw).get("clients", [])
+                except json.JSONDecodeError:
+                    continue
+            elif isinstance(s_raw, dict):
+                clients = s_raw.get("clients", [])
+            else:
+                continue
+            if any(str(c.get("email") or "").strip() == target for c in clients):
+                return iid
+        raise XUIAPIError(f"Client email '{target}' not found in any inbound.")
+
+    async def set_client_expiry(self, inbound_id: int, email: str, expiry_ms: int) -> None:
+        settings = await self._get_inbound_settings(inbound_id)
+        clients = settings.get("clients", [])
+        target = (email or "").strip()
+        client_uuid: str | None = None
+        for c in clients:
+            if str(c.get("email") or "").strip() == target:
+                c["expiryTime"] = int(expiry_ms)
+                raw_id = c.get("id")
+                client_uuid = str(raw_id).strip() if raw_id is not None else None
+                break
+        else:
+            raise XUIAPIError(f"Client '{target}' not found in inbound {inbound_id}.")
+        if not client_uuid:
+            raise XUIAPIError(f"Client '{target}' has no id (UUID) in inbound settings.")
+        # 3x-ui UpdateInboundClient ожидает в settings.clients ровно ОДНОГО клиента;
+        # иначе clients[0] не совпадает с обновляемым и срабатывает Duplicate email.
+        one = copy.deepcopy(next(c for c in clients if str(c.get("email") or "").strip() == target))
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [one]})}
+        path = f"/panel/api/inbounds/updateClient/{client_uuid}"
+        await self._request("POST", path, json_body=payload)
+
+    async def set_client_limit_ip(self, inbound_id: int, email: str, limit_ip: int) -> None:
+        settings = await self._get_inbound_settings(inbound_id)
+        clients = settings.get("clients", [])
+        target = (email or "").strip()
+        client_uuid: str | None = None
+        for c in clients:
+            if str(c.get("email") or "").strip() == target:
+                c["limitIp"] = int(limit_ip)
+                raw_id = c.get("id")
+                client_uuid = str(raw_id).strip() if raw_id is not None else None
+                break
+        else:
+            raise XUIAPIError(f"Client '{target}' not found in inbound {inbound_id}.")
+        if not client_uuid:
+            raise XUIAPIError(f"Client '{target}' has no id (UUID) in inbound settings.")
+        one = copy.deepcopy(next(c for c in clients if str(c.get("email") or "").strip() == target))
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [one]})}
+        path = f"/panel/api/inbounds/updateClient/{client_uuid}"
+        await self._request("POST", path, json_body=payload)
+
     async def disable_client(self, inbound_id: int, email: str) -> None:
         settings = await self._get_inbound_settings(inbound_id)
         clients = settings.get("clients", [])
+        target = (email or "").strip()
+        client_uuid: str | None = None
         for c in clients:
-            if c.get("email") == email:
+            if str(c.get("email") or "").strip() == target:
                 c["enable"] = False
+                raw_id = c.get("id")
+                client_uuid = str(raw_id).strip() if raw_id is not None else None
                 break
-        payload = {"id": inbound_id, "settings": json.dumps({"clients": clients})}
-        await self._request("POST", "/panel/api/inbounds/updateClient", json_body=payload)
+        else:
+            raise XUIAPIError(f"Client '{target}' not found in inbound {inbound_id}.")
+        if not client_uuid:
+            raise XUIAPIError(f"Client '{target}' has no id (UUID) in inbound settings.")
+        one = copy.deepcopy(next(c for c in clients if str(c.get("email") or "").strip() == target))
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [one]})}
+        path = f"/panel/api/inbounds/updateClient/{client_uuid}"
+        await self._request("POST", path, json_body=payload)
 
     async def _get_inbound_settings(self, inbound_id: int) -> dict:
         for inbound in await self.get_inbounds():

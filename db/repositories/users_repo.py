@@ -30,6 +30,16 @@ class UsersRepository:
             async with db.execute("SELECT changes()") as cur:
                 return (await cur.fetchone())[0] > 0
 
+    async def set_subscription_until(self, tg_id: int, end_iso: str) -> None:
+        """Единая дата окончания: paid_until и trial_end (для /status и панели)."""
+        now = utc_now_iso()
+        async with get_connection(self.db_path) as c:
+            await c.execute(
+                "UPDATE users SET paid_until=?, trial_end=?, updated_at=? WHERE tg_id=?",
+                (end_iso, end_iso, now, tg_id),
+            )
+            await c.commit()
+
     async def set_trial(self, tg_id: int, trial_start: str, trial_end: str, xui_email: str, xui_uuid: str, subscription_url: str) -> None:
         now = utc_now_iso()
         async with get_connection(self.db_path) as c:

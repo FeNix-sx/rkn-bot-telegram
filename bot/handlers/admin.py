@@ -1,10 +1,16 @@
 from __future__ import annotations
-import logging
-import aiosqlite
+import calendar
 import json
+import logging
+import os
+import re
+import aiosqlite
+from datetime import datetime, time, timezone
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from bot.keyboards import reply_menu, admin_menu, back_admin
 from core.xui_api import XUIAPI
 from core.config import Settings
@@ -15,8 +21,87 @@ from bot.handlers.user import PENDING_TRIALS, _issue_trial_now
 LOGGER = logging.getLogger(__name__)
 router = Router()
 
+
+class AdminRenew(StatesGroup):
+    waiting_manual_date = State()
+
+
+def _sub_end_datetime(row: dict) -> datetime | None:
+    raw = row.get("paid_until") or row.get("trial_end")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _add_one_calendar_month(dt: datetime) -> datetime:
+    y, m, d = dt.year, dt.month + 1, dt.day
+    if m > 12:
+        y, m = y + 1, m - 12
+    last = calendar.monthrange(y, m)[1]
+    d = min(d, last)
+    return dt.replace(year=y, month=m, day=d)
+
+
+def _eod_plus_one_month_from_today_utc() -> datetime:
+    today = datetime.now(timezone.utc).date()
+    y, m, d = today.year, today.month + 1, today.day
+    if m > 12:
+        y, m = y + 1, m - 12
+    last = calendar.monthrange(y, m)[1]
+    d = min(d, last)
+    return datetime(y, m, d, 23, 59, 59, tzinfo=timezone.utc)
+
+
+def _parse_ddmmyyyy(s: str) -> datetime | None:
+    s = (s or "").strip()
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", s)
+    if not m:
+        return None
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if mo < 1 or mo > 12 or d < 1 or d > calendar.monthrange(y, mo)[1]:
+        return None
+    return datetime(y, mo, d, 23, 59, 59, tzinfo=timezone.utc)
+
+
+async def _apply_subscription_end(
+    tg_id: int,
+    new_end: datetime,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+) -> str:
+    new_end = new_end.astimezone(timezone.utc)
+    end_iso = new_end.isoformat(timespec="seconds")
+    row = await users_repo.get_user(tg_id)
+    if not row:
+        raise ValueError("Пользователь не найден в БД.")
+    email = (row.get("xui_email") or "").strip()
+    if not email:
+        raise ValueError("Нет привязанного xui_email.")
+    await users_repo.set_subscription_until(tg_id, end_iso)
+    xui_note = ""
+    if not os.getenv("MOCK_XUI"):
+        try:
+            iid = await xui_api.find_inbound_id_for_email(email)
+            ms = int(new_end.timestamp() * 1000)
+            await xui_api.set_client_expiry(iid, email, ms)
+        except Exception as e:
+            LOGGER.warning("renew.xui.warn: %s", e)
+            xui_note = f"\n⚠️ БД обновлена; 3X-UI: {e}"
+    return f"✅ Срок подписки до: {end_iso} UTC{xui_note}"
+
+
 async def _is_admin(tg_id: int, settings: Settings, users_repo: UsersRepository) -> bool:
     return tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
+
+def _btn_user_label(username: str | None, tg_id: int, max_len: int = 22) -> str:
+    raw = (username or "").strip() or f"ID:{tg_id}"
+    return raw if len(raw) <= max_len else raw[: max_len - 1] + "…"
 
 @router.message(F.text == "⚙️ Управление")
 async def admin_main(msg: Message, settings: Settings, users_repo: UsersRepository):
@@ -31,31 +116,283 @@ async def admin_main_cb(cb: CallbackQuery, settings: Settings, users_repo: Users
     await cb.answer()
     await cb.message.answer("⚙️ Управление:", reply_markup=admin_menu())
 
-@router.callback_query(F.data == "admin:bound")
+@router.callback_query((F.data == "admin:bound") | F.data.startswith("admin:bound:page:"))
 async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    page = int(parts[3]) if len(parts) > 3 and parts[2] == "page" else 0
     await cb.answer()
     try:
         async with aiosqlite.connect(settings.db_path) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT tg_id, username, xui_email FROM users WHERE xui_email IS NOT NULL AND xui_email != '' ORDER BY tg_id") as cur:
+            async with db.execute(
+                "SELECT tg_id, username, xui_email FROM users WHERE xui_email IS NOT NULL AND xui_email != '' ORDER BY tg_id"
+            ) as cur:
                 users = await cur.fetchall()
-        if not users: return await cb.message.answer("📭 Пусто.", reply_markup=back_admin())
+        if not users:
+            return await cb.message.answer("📭 Пусто.", reply_markup=back_admin())
         inbounds = await xui_api.get_inbounds()
-        blocks = []
+        rows: list[tuple[int, str | None, str, int]] = []
         for u in users:
             email = u["xui_email"]
             st = next((c for ib in inbounds for c in (ib.get("clientStats") or []) if c.get("email") == email), None)
-            up = st.get("up", 0) if st else 0
-            down = st.get("down", 0) if st else 0
-            total = up + down
-            name = u["username"] or f"ID:{u['tg_id']}"
-            blocks.append(f"👤 `{name}`\n📊 трафик: ↑{up/1024**3:.2f} ГБ ↓{down/1024**3:.2f} ГБ | {total/1024**3:.2f} ГБ общий")
-        await cb.message.answer("📊 Привязанные:\n\n" + "\n\n──────────────\n\n".join(blocks[:5]), reply_markup=back_admin())
+            up = int(st.get("up", 0) if st else 0)
+            rows.append((u["tg_id"], u["username"], email, up))
+        total = len(rows)
+        page_size = 7
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        current = rows[page * page_size : (page + 1) * page_size]
+        kb = [
+            [
+                InlineKeyboardButton(
+                    text=f"👤 {_btn_user_label(un, tid)} | ↑{up // 1024**2}МБ",
+                    callback_data=f"bound:user:{tid}:{page}",
+                )
+            ]
+            for tid, un, _email, up in current
+        ]
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin:bound:page:{page - 1}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:bound:page:{page + 1}"))
+        if nav:
+            kb.append(nav)
+        kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
+        await cb.message.answer(
+            f"👥 Привязанные (стр. {page + 1}/{total_pages}):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        )
     except Exception as e:
         LOGGER.exception("admin.bound.error")
         await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+
+@router.callback_query(F.data.startswith("bound:user:"))
+async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    seg = cb.data.split(":")
+    if len(seg) < 4:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    tg_id, list_page = int(seg[2]), int(seg[3])
+    await cb.answer()
+    row = await users_repo.get_user(tg_id)
+    label = _btn_user_label(row.get("username") if row else None, tg_id, max_len=40) if row else str(tg_id)
+    email = (row.get("xui_email") or "") if row else ""
+    head = f"👤 {label} ({tg_id})"
+    if email:
+        head += f"\n📧 {email}"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 Продлить подписку", callback_data=f"bound:renew:start:{tg_id}:{list_page}")],
+            [InlineKeyboardButton(text="📶 Количество подключений (IP limit)", callback_data=f"bound:iplimit:menu:{tg_id}:{list_page}")],
+            [
+                InlineKeyboardButton(text="👑 Сделать админом", callback_data=f"bound:stub:grant_admin:{tg_id}"),
+                InlineKeyboardButton(text="🚫 Убрать админа", callback_data=f"bound:stub:revoke_admin:{tg_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="⏸ Отключить", callback_data=f"bound:stub:disable:{tg_id}"),
+                InlineKeyboardButton(text="▶️ Включить", callback_data=f"bound:stub:enable:{tg_id}"),
+            ],
+            [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"bound:stub:delete:{tg_id}")],
+            [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")],
+        ]
+    )
+    await cb.message.answer(head + "\n\nНастройки (заглушки):", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("bound:iplimit:"))
+async def bound_iplimit_flow(
+    cb: CallbackQuery,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    kind = parts[2]
+    if kind == "menu":
+        tg_id, list_page = int(parts[3]), int(parts[4])
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row or not (row.get("xui_email") or "").strip():
+            return await cb.message.answer("❌ Нет привязки к панели.", reply_markup=back_admin())
+        nums = [
+            InlineKeyboardButton(text=str(n), callback_data=f"bound:iplimit:set:{tg_id}:{list_page}:{n}")
+            for n in (1, 2, 3, 4, 5)
+        ]
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                nums,
+                [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
+            ]
+        )
+        return await cb.message.answer("Лимит одновременных подключений (IP limit), значение 1–5:", reply_markup=kb)
+    if kind == "set":
+        if len(parts) < 6:
+            return await cb.answer("Ошибка данных", show_alert=True)
+        tg_id, list_page, lim = int(parts[3]), int(parts[4]), int(parts[5])
+        if lim not in (1, 2, 3, 4, 5):
+            return await cb.answer("Только 1–5", show_alert=True)
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+        email = (row.get("xui_email") or "").strip()
+        if not email:
+            return await cb.message.answer("❌ Нет xui_email.", reply_markup=back_admin())
+        try:
+            if os.getenv("MOCK_XUI"):
+                txt = f"✅ MOCK: limitIp={lim} для {email}"
+            else:
+                iid = await xui_api.find_inbound_id_for_email(email)
+                await xui_api.set_client_limit_ip(iid, email, lim)
+                txt = f"✅ Лимит IP для {email}: {lim}"
+        except Exception as e:
+            LOGGER.exception("iplimit.set.error")
+            txt = f"❌ {e}"
+        return await cb.message.answer(
+            txt,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")]
+                ]
+            ),
+        )
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bound:renew:"))
+async def bound_renew_flow(
+    cb: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 4:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    kind = parts[2]
+    if kind == "cancel":
+        list_page = int(parts[3]) if len(parts) > 3 else 0
+        await state.clear()
+        await cb.answer("Отменено")
+        return await cb.message.answer(
+            "Продление отменено.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")]
+                ]
+            ),
+        )
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    tg_id, list_page = int(parts[3]), int(parts[4])
+    if kind == "start":
+        await state.set_state(AdminRenew.waiting_manual_date)
+        await state.update_data(target_tg_id=tg_id, list_page=list_page)
+        await cb.answer()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📆 На 1 месяц", callback_data=f"bound:renew:1m:{tg_id}:{list_page}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bound:renew:cancel:{list_page}")],
+            ]
+        )
+        return await cb.message.answer(
+            f"Продление подписки для {tg_id}.\n\n"
+            "Отправь дату окончания: ДД.ММ.ГГГГ (до 23:59:59 UTC этого дня), "
+            "или нажми «На 1 месяц».",
+            reply_markup=kb,
+        )
+    if kind == "1m":
+        await state.clear()
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+        now = datetime.now(timezone.utc)
+        end_dt = _sub_end_datetime(row)
+        if end_dt and end_dt > now:
+            new_end = _add_one_calendar_month(end_dt)
+        else:
+            new_end = _eod_plus_one_month_from_today_utc()
+        try:
+            txt = await _apply_subscription_end(tg_id, new_end, users_repo, xui_api)
+        except Exception as e:
+            LOGGER.exception("renew.1m.error")
+            txt = f"❌ {e}"
+        return await cb.message.answer(
+            txt,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")]
+                ]
+            ),
+        )
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
+@router.message(StateFilter(AdminRenew.waiting_manual_date), F.text)
+async def bound_renew_manual_date(
+    msg: Message,
+    state: FSMContext,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not msg.from_user or not await _is_admin(msg.from_user.id, settings, users_repo):
+        await state.clear()
+        return
+    data = await state.get_data()
+    tg_id = int(data.get("target_tg_id", 0))
+    list_page = int(data.get("list_page", 0))
+    parsed = _parse_ddmmyyyy(msg.text)
+    if not parsed:
+        return await msg.answer("❌ Неверный формат. Нужно ДД.ММ.ГГГГ, например 09.06.2026")
+    await state.clear()
+    try:
+        txt = await _apply_subscription_end(tg_id, parsed, users_repo, xui_api)
+    except Exception as e:
+        LOGGER.exception("renew.manual.error")
+        txt = f"❌ {e}"
+    await msg.answer(
+        txt,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")]
+            ]
+        ),
+    )
+
+
+_STUB_LABELS = {
+    "grant_admin": "Сделать админом",
+    "revoke_admin": "Убрать админа",
+    "disable": "Отключить клиента в панели",
+    "enable": "Включить клиента в панели",
+    "delete": "Удалить полностью (БД + 3X-UI)",
+}
+
+@router.callback_query(F.data.startswith("bound:stub:"))
+async def bound_stub_echo(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    seg = cb.data.split(":")
+    if len(seg) < 4:
+        await cb.answer()
+        return await cb.message.answer(f"🔧 Заглушка (raw): {cb.data}")
+    action, tg_s = seg[2], seg[3]
+    label = _STUB_LABELS.get(action, action)
+    await cb.answer()
+    await cb.message.answer(f"🔧 Заглушка: {label}\ntg_id: {tg_s}\nraw: {cb.data}")
 
 @router.callback_query(F.data.startswith("admin:unbound"))
 async def admin_unbound(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
