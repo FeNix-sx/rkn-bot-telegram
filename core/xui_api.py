@@ -140,6 +140,16 @@ class XUIAPI:
                 return iid
         raise XUIAPIError(f"Client email '{target}' not found in any inbound.")
 
+    async def get_client_enabled(self, email: str) -> bool:
+        """Текущий флаг enable клиента в inbound (как переключатель в панели)."""
+        iid = await self.find_inbound_id_for_email(email)
+        settings = await self._get_inbound_settings(iid)
+        target = (email or "").strip()
+        for c in settings.get("clients", []):
+            if str(c.get("email") or "").strip() == target:
+                return bool(c.get("enable", True))
+        raise XUIAPIError(f"Client '{target}' not found in inbound {iid}.")
+
     async def set_client_expiry(self, inbound_id: int, email: str, expiry_ms: int) -> None:
         settings = await self._get_inbound_settings(inbound_id)
         clients = settings.get("clients", [])
@@ -190,6 +200,26 @@ class XUIAPI:
         for c in clients:
             if str(c.get("email") or "").strip() == target:
                 c["enable"] = False
+                raw_id = c.get("id")
+                client_uuid = str(raw_id).strip() if raw_id is not None else None
+                break
+        else:
+            raise XUIAPIError(f"Client '{target}' not found in inbound {inbound_id}.")
+        if not client_uuid:
+            raise XUIAPIError(f"Client '{target}' has no id (UUID) in inbound settings.")
+        one = copy.deepcopy(next(c for c in clients if str(c.get("email") or "").strip() == target))
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [one]})}
+        path = f"/panel/api/inbounds/updateClient/{client_uuid}"
+        await self._request("POST", path, json_body=payload)
+
+    async def enable_client(self, inbound_id: int, email: str) -> None:
+        settings = await self._get_inbound_settings(inbound_id)
+        clients = settings.get("clients", [])
+        target = (email or "").strip()
+        client_uuid: str | None = None
+        for c in clients:
+            if str(c.get("email") or "").strip() == target:
+                c["enable"] = True
                 raw_id = c.get("id")
                 client_uuid = str(raw_id).strip() if raw_id is not None else None
                 break

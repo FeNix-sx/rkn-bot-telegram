@@ -201,8 +201,8 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
                 InlineKeyboardButton(text="🚫 Убрать админа", callback_data=f"bound:revoke_admin:ask:{tg_id}:{list_page}"),
             ],
             [
-                InlineKeyboardButton(text="⏸ Отключить", callback_data=f"bound:stub:disable:{tg_id}"),
-                InlineKeyboardButton(text="▶️ Включить", callback_data=f"bound:stub:enable:{tg_id}"),
+                InlineKeyboardButton(text="⏸ Отключить", callback_data=f"bound:xui_toggle:ask:disable:{tg_id}:{list_page}"),
+                InlineKeyboardButton(text="▶️ Включить", callback_data=f"bound:xui_toggle:ask:enable:{tg_id}:{list_page}"),
             ],
             [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"bound:stub:delete:{tg_id}")],
             [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")],
@@ -516,9 +516,97 @@ async def bound_revoke_admin_flow(cb: CallbackQuery, settings: Settings, users_r
     return await cb.answer("Неизвестное действие", show_alert=True)
 
 
+@router.callback_query(F.data.startswith("bound:xui_toggle:"))
+async def bound_xui_toggle_flow(
+    cb: CallbackQuery,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 6:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    action, mode, tg_id, list_page = parts[2], parts[3], int(parts[4]), int(parts[5])
+    if mode not in ("disable", "enable"):
+        return await cb.answer("Ошибка данных", show_alert=True)
+
+    verb_off = mode == "disable"
+    q = (
+        "Отключить клиента на панели 3X-UI? Только переключатель «вкл/выкл», без удаления и без смены подписки и лимитов."
+        if verb_off
+        else "Включить клиента на панели 3X-UI (только переключатель «вкл»)?"
+    )
+    already = "ℹ️ Клиент на панели уже отключён." if verb_off else "ℹ️ Клиент на панели уже включён."
+    done = "✅ Клиент отключён на панели." if verb_off else "✅ Клиент включён на панели."
+
+    async def _fetch_enabled(em: str) -> bool | None:
+        if os.getenv("MOCK_XUI"):
+            return None
+        try:
+            return await xui_api.get_client_enabled(em)
+        except Exception:
+            LOGGER.exception("xui_toggle.read_enable")
+            return None
+
+    if action == "ask":
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+        email = (row.get("xui_email") or "").strip()
+        if not email:
+            return await cb.message.answer("❌ Нет привязки к панели (xui_email).", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        cur = await _fetch_enabled(email)
+        if cur is not None:
+            if verb_off and not cur:
+                return await cb.message.answer(already, reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+            if not verb_off and cur:
+                return await cb.message.answer(already, reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Да", callback_data=f"bound:xui_toggle:yes:{mode}:{tg_id}:{list_page}"),
+                    InlineKeyboardButton(text="❌ Нет", callback_data=f"bound:xui_toggle:no:{mode}:{tg_id}:{list_page}"),
+                ],
+                [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
+            ]
+        )
+        return await cb.message.answer(q, reply_markup=kb)
+
+    if action == "yes":
+        await cb.answer()
+        row = await users_repo.get_user(tg_id)
+        if not row:
+            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+        email = (row.get("xui_email") or "").strip()
+        if not email:
+            return await cb.message.answer("❌ Нет xui_email.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        if os.getenv("MOCK_XUI"):
+            return await cb.message.answer(
+                f"✅ MOCK: клиент «{email}» {'отключён' if verb_off else 'включён'}.",
+                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            )
+        try:
+            iid = await xui_api.find_inbound_id_for_email(email)
+            if verb_off:
+                await xui_api.disable_client(iid, email)
+            else:
+                await xui_api.enable_client(iid, email)
+        except Exception as e:
+            LOGGER.exception("xui_toggle.apply")
+            return await cb.message.answer(f"❌ {e}", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        return await cb.message.answer(done, reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+
+    if action == "no":
+        await cb.answer("Отменено")
+        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
 _STUB_LABELS = {
-    "disable": "Отключить клиента в панели",
-    "enable": "Включить клиента в панели",
     "delete": "Удалить полностью (БД + 3X-UI)",
 }
 
