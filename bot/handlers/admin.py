@@ -17,6 +17,7 @@ from core.config import Settings
 from db.repositories.users_repo import UsersRepository
 from db.database import utc_now_iso
 from bot.handlers.user import PENDING_TRIALS, _issue_trial_now
+from bot.handlers.stats import _admin_display
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
@@ -170,7 +171,8 @@ async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRe
             kb.append(nav)
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
         await cb.message.answer(
-            f"👥 Привязанные (стр. {page + 1}/{total_pages}):",
+            f"👥 Привязанные (стр. {page + 1}/{total_pages}):\n\n"
+            "Пользователи с Telegram, у которых в боте указан клиент 3X-UI (полная связка ТГ ↔ VPN).",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         )
     except Exception as e:
@@ -192,6 +194,9 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
     head = f"👤 {label} ({tg_id})"
     if email:
         head += f"\n📧 {email}"
+    ap_t = await _admin_display(users_repo, row.get("approved_by_tg_id") if row else None)
+    vp_t = await _admin_display(users_repo, row.get("vpn_issued_by_tg_id") if row else None)
+    head += f"\n✅ Одобрил: {ap_t or '—'}\n🔗 VPN: {vp_t or '—'}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📅 Продлить подписку", callback_data=f"bound:renew:start:{tg_id}:{list_page}")],
@@ -204,11 +209,53 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
                 InlineKeyboardButton(text="⏸ Отключить", callback_data=f"bound:xui_toggle:ask:disable:{tg_id}:{list_page}"),
                 InlineKeyboardButton(text="▶️ Включить", callback_data=f"bound:xui_toggle:ask:enable:{tg_id}:{list_page}"),
             ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Я ответственный админ",
+                    callback_data=f"bound:claim_steward:{tg_id}:{list_page}",
+                )
+            ],
             [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"bound:stub:delete:{tg_id}")],
             [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")],
         ]
     )
     await cb.message.answer(head + "\n\nНастройки (заглушки):", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("bound:claim_steward:"))
+async def bound_claim_steward(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    if not cb.from_user:
+        return await cb.answer("Нет данных", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 4:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    tg_id, list_page = int(parts[2]), int(parts[3])
+    me = cb.from_user.id
+    row = await users_repo.get_user(tg_id)
+    if not row:
+        return await cb.answer("Пользователь не найден", show_alert=True)
+    ap = row.get("approved_by_tg_id")
+    vp = row.get("vpn_issued_by_tg_id")
+    if ap is not None and vp is not None:
+        return await cb.answer("Оба поля уже заполнены", show_alert=True)
+    await users_repo.fill_steward_nulls(tg_id, me)
+    await cb.answer("✅ Сохранено: пустые слоты → ты")
+    filled = []
+    if ap is None:
+        filled.append("одобрение")
+    if vp is None:
+        filled.append("VPN")
+    await cb.message.answer(
+        f"👤 {tg_id}: записал тебя в: {', '.join(filled)}.\n"
+        f"Открой карточку снова из списка привязанных (стр. {list_page + 1}), чтобы увидеть строки.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 К карточке", callback_data=f"bound:user:{tg_id}:{list_page}")],
+            ]
+        ),
+    )
 
 
 @router.callback_query(F.data.startswith("bound:iplimit:"))
@@ -658,7 +705,11 @@ async def admin_unbound(cb: CallbackQuery, settings: Settings, users_repo: Users
         if page < total_pages - 1: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:unbound:page:{page+1}"))
         if nav: kb.append(nav)
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
-        await cb.message.answer(f"🔗 Непривязанные (Стр. {page+1}/{total_pages}):", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await cb.message.answer(
+            f"🔗 Непривязанные (стр. {page + 1}/{total_pages}):\n\n"
+            "Клиенты есть в 3X-UI, но в боте нет записи, к какому Telegram они относятся.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        )
     except Exception as e:
         LOGGER.exception("admin.unbound.error")
         await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
@@ -694,9 +745,16 @@ async def bind_do_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRep
         if not uuid: return await cb.message.answer("❌ UUID не найден.", reply_markup=back_admin())
         now = utc_now_iso()
         async with aiosqlite.connect(users_repo.db_path) as db:
-            cur = await db.execute("UPDATE users SET xui_email=?, xui_uuid=?, username=COALESCE(NULLIF(?, ''), username), updated_at=? WHERE tg_id=?", (email, uuid, "", now, tg_id))
+            issuer = cb.from_user.id if cb.from_user else None
+            cur = await db.execute(
+                "UPDATE users SET xui_email=?, xui_uuid=?, username=COALESCE(NULLIF(?, ''), username), vpn_issued_by_tg_id=?, updated_at=? WHERE tg_id=?",
+                (email, uuid, "", issuer, now, tg_id),
+            )
             if cur.rowcount == 0:
-                await db.execute("INSERT INTO users (tg_id, username, xui_email, xui_uuid, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (tg_id, "", email, uuid, 'manual', now, now))
+                await db.execute(
+                    "INSERT INTO users (tg_id, username, xui_email, xui_uuid, status, vpn_issued_by_tg_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (tg_id, "", email, uuid, "manual", issuer, now, now),
+                )
             await db.commit()
         await cb.message.answer(f"✅ Привязано: `{tg_id}` ↔ `{email}`", reply_markup=back_admin())
     except Exception as e:
@@ -715,7 +773,12 @@ async def admin_unknown_list(cb: CallbackQuery, settings: Settings, users_repo: 
         if not unknown: return await cb.message.answer("✅ Все пользователи из бота привязаны к панели.", reply_markup=back_admin())
         kb = [[InlineKeyboardButton(text=f"👤 {u['username'] or u['first_name'] or 'ID:' + str(u['tg_id'])} ({u['tg_id']})", callback_data=f"bind:unknown:{u['tg_id']}")] for u in unknown[:10]]
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
-        await cb.message.answer("❓ Не в базе (нажали /start, но нет в 3X-UI):\nВыберите для привязки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        await cb.message.answer(
+            "❓ Не в базе:\n\n"
+            "Пользователи открыли бота, но в 3X-UI для них нет привязанного клиента (или связь не оформлена).\n\n"
+            "Выберите для привязки:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        )
     except Exception as e:
         LOGGER.exception("admin.unknown.error")
         await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
@@ -768,7 +831,11 @@ async def bind_unknown_do(cb: CallbackQuery, settings: Settings, users_repo: Use
         if not uuid: return await cb.message.answer("❌ UUID не найден.", reply_markup=back_admin())
         now = utc_now_iso()
         async with aiosqlite.connect(users_repo.db_path) as db:
-            cur = await db.execute("UPDATE users SET xui_email=?, xui_uuid=?, status='active', updated_at=? WHERE tg_id=?", (target_email, uuid, now, tg_id))
+            issuer = cb.from_user.id if cb.from_user else None
+            cur = await db.execute(
+                "UPDATE users SET xui_email=?, xui_uuid=?, status='active', vpn_issued_by_tg_id=?, updated_at=? WHERE tg_id=?",
+                (target_email, uuid, issuer, now, tg_id),
+            )
             if cur.rowcount == 0: return await cb.message.answer(f"❌ Юзер {tg_id} не найден.", reply_markup=back_admin())
             await db.commit()
         await cb.message.answer(f"✅ Привязано: `{tg_id}` ↔ `{target_email}`", reply_markup=back_admin())
@@ -785,7 +852,11 @@ async def trial_approve(cb: CallbackQuery, settings: Settings, users_repo: Users
     if not req: return await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
     await cb.answer("✅ Одобрено")
     try:
-        url = await _issue_trial_now(tg_id, settings, users_repo, xui_api)
+        approver = cb.from_user.id if cb.from_user else None
+        await users_repo.set_trial_approved_by(tg_id, approver)
+        url = await _issue_trial_now(
+            tg_id, settings, users_repo, xui_api, vpn_issued_by_tg_id=approver
+        )
         await bot.send_message(tg_id, f"✅ Триал одобрен и активирован!\n🔗 {url}")
     except Exception as e:
         await bot.send_message(tg_id, f"❌ Ошибка активации: {e}")

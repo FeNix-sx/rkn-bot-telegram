@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS users (
     paid_until TEXT,
     plan_devices INTEGER NOT NULL DEFAULT 1,
     is_admin INTEGER NOT NULL DEFAULT 0,
+    approved_by_tg_id INTEGER,
+    vpn_issued_by_tg_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

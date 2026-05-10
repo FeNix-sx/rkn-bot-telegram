@@ -45,6 +45,17 @@ async def _get_client_info(xui_api: XUIAPI, email: str) -> dict:
         LOGGER.exception("xui.client_info.error")
     return {"limit_ip": 1, "enable": True, "expiry_ms": 0}
 
+async def _admin_display(users_repo: UsersRepository, admin_tg: int | None) -> str | None:
+    if admin_tg is None:
+        return None
+    row = await users_repo.get_user(admin_tg)
+    if row:
+        un = (row.get("username") or "").strip().lstrip("@")
+        if un:
+            return f"@{un}"
+    return f"ID:{admin_tg}"
+
+
 def _format_stat_block(
     name: str | None,
     up: int,
@@ -52,6 +63,8 @@ def _format_stat_block(
     info: dict,
     show_name: bool = True,
     role_label: str | None = None,
+    trial_approver: str | None = None,
+    vpn_issuer: str | None = None,
 ) -> str:
     total = up + down
     lines = []
@@ -59,6 +72,9 @@ def _format_stat_block(
         lines.append(f"👤 `{name}`")
     if role_label:
         lines.append(f"🔑 Полномочия: `{role_label}`")
+    if trial_approver is not None or vpn_issuer is not None:
+        lines.append(f"✅ Одобрил: `{trial_approver or '—'}`")
+        lines.append(f"🔗 VPN: `{vpn_issuer or '—'}`")
     lines.append(f"📊 трафик: ↑{_gb(up)} ↓{_gb(down)} | {_gb(total)} общий")
     lines.append(f"🔗 подключений: `{info['limit_ip']}`")
     lines.append(f"📡 статус: {'✅ вкл' if info['enable'] else '❌ откл'}")
@@ -79,7 +95,7 @@ async def stats_command(msg: Message, settings: Settings, users_repo: UsersRepos
     if not tg: return
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
     if is_adm:
-        await _render_admin_stats(msg, settings, xui_api)
+        await _render_admin_stats(msg, settings, users_repo, xui_api)
     else:
         await show_personal_stats(msg, tg.id, settings, users_repo, xui_api)
 
@@ -92,7 +108,7 @@ async def stats_reply_button(msg: Message, settings: Settings, users_repo: Users
     if not is_adm:
         await msg.answer("🚫 Нет доступа.", reply_markup=reply_menu(False))
         return
-    await _render_admin_stats(msg, settings, xui_api)
+    await _render_admin_stats(msg, settings, users_repo, xui_api)
 
 async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     try:
@@ -113,7 +129,11 @@ async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, user
         down = client_stats.get("down", 0) if client_stats else 0
         info = await _get_client_info(xui_api, email)
 
-        text = _format_stat_block(None, up, down, info, show_name=False, role_label=role)
+        ap = await _admin_display(users_repo, row.get("approved_by_tg_id"))
+        vp = await _admin_display(users_repo, row.get("vpn_issued_by_tg_id"))
+        text = _format_stat_block(
+            None, up, down, info, show_name=False, role_label=role, trial_approver=ap, vpn_issuer=vp
+        )
         is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
         await msg.answer(text, parse_mode="Markdown", reply_markup=reply_menu(is_adm))
     except Exception as e:
@@ -121,12 +141,12 @@ async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, user
         is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
         await msg.answer(f"❌ Ошибка: {type(e).__name__}", reply_markup=reply_menu(is_adm))
 
-async def _render_admin_stats(msg: Message, settings: Settings, xui_api: XUIAPI):
+async def _render_admin_stats(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     try:
         async with aiosqlite.connect(settings.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("""
-                SELECT tg_id, username, xui_email, is_admin
+                SELECT tg_id, username, xui_email, is_admin, approved_by_tg_id, vpn_issued_by_tg_id
                 FROM users WHERE xui_email IS NOT NULL AND xui_email != '' ORDER BY tg_id
             """) as cur:
                 users = await cur.fetchall()
@@ -145,7 +165,13 @@ async def _render_admin_stats(msg: Message, settings: Settings, xui_api: XUIAPI)
             name = u["username"] or f"ID:{u['tg_id']}"
             rid = u["tg_id"]
             role = _role_label(rid, settings, {k: u[k] for k in u.keys()})
-            blocks.append(_format_stat_block(name, up, down, info, show_name=True, role_label=role))
+            ap = await _admin_display(users_repo, u["approved_by_tg_id"])
+            vp = await _admin_display(users_repo, u["vpn_issued_by_tg_id"])
+            blocks.append(
+                _format_stat_block(
+                    name, up, down, info, show_name=True, role_label=role, trial_approver=ap, vpn_issuer=vp
+                )
+            )
 
         text = "📊 Привязанные:\n\n" + "\n\n──────────────\n\n".join(blocks[:5])
         await msg.answer(text, parse_mode="Markdown", reply_markup=back_admin())

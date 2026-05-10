@@ -35,14 +35,29 @@ def _is_sub_active(row: dict | None) -> tuple[bool, str | None]:
     except: pass
     return False, None
 
-async def _issue_trial_now(tg_id: int, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI) -> str:
+async def _issue_trial_now(
+    tg_id: int,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    *,
+    vpn_issued_by_tg_id: int | None = None,
+) -> str:
     start = datetime.now(timezone.utc)
     end = start + timedelta(days=settings.trial_days)
     email = f"trial_{tg_id}"
     uuid_val = str(uuid4())
     if os.getenv("MOCK_XUI"):
         url = f"mock://sub/{email}"
-        await users_repo.set_trial(tg_id, start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds"), email, uuid_val, url)
+        await users_repo.set_trial(
+            tg_id,
+            start.isoformat(timespec="seconds"),
+            end.isoformat(timespec="seconds"),
+            email,
+            uuid_val,
+            url,
+            vpn_issued_by_tg_id=vpn_issued_by_tg_id,
+        )
         return url
     inbound_id = await xui_api.resolve_inbound_id("vless_reality")
     await xui_api.add_client(inbound_id, email, uuid_val, limit_ip=1)
@@ -54,6 +69,7 @@ async def _issue_trial_now(tg_id: int, settings: Settings, users_repo: UsersRepo
         email,
         uuid_val,
         url,
+        vpn_issued_by_tg_id=vpn_issued_by_tg_id,
     )
     return url
 
