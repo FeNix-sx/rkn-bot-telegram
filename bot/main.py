@@ -24,7 +24,11 @@ async def run(settings) -> None:
     xui_api = XUIAPI(settings.xui_api_url, settings.xui_username, settings.xui_password)
     try:
         await xui_api.login()
-        LOGGER.info("3X-UI connected")
+        LOGGER.info(
+            "3X-UI connected (inbound id=%s tag=%s)",
+            settings.xui_inbound_id,
+            settings.xui_inbound_tag,
+        )
     except Exception as e:
         LOGGER.warning("3X-UI offline: %s", e)
 

@@ -29,9 +29,13 @@ class UsersRepository:
                 return dict(row) if row else None
 
     async def create_user_if_not_exists(self, tg_id: int, username: str|None, first_name: str|None, last_name: str|None) -> bool:
+        now = utc_now_iso()
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("INSERT OR IGNORE INTO users (tg_id, username, first_name, last_name, status) VALUES (?,?,?,?,'new')",
-                (tg_id, username or "", first_name or "", last_name or ""))
+            await db.execute(
+                """INSERT OR IGNORE INTO users (tg_id, username, first_name, last_name, status, created_at, updated_at)
+                   VALUES (?,?,?,?,'new',?,?)""",
+                (tg_id, username or "", first_name or "", last_name or "", now, now),
+            )
             await db.commit()
             async with db.execute("SELECT changes()") as cur:
                 return (await cur.fetchone())[0] > 0

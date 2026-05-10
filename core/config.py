@@ -2,7 +2,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+import logging
 import os
+
+LOGGER = logging.getLogger(__name__)
+# Корень репозитория (рядом с core/, bot/), чтобы .env находился независимо от cwd
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 REQUIRED_ENV_VARS = (
     "BOT_TOKEN", "XUI_API_URL", "XUI_USERNAME", "XUI_PASSWORD",
@@ -20,17 +25,21 @@ class Settings:
     xui_api_url: str
     xui_username: str
     xui_password: str
+    xui_inbound_tag: str
+    xui_inbound_id: int | None
     admin_ids: tuple[int, ...]
     trial_days: int
     db_path: str
 
 def _load_dotenv_file(env_path: Path) -> None:
+    """Подставляет переменные из файла в os.environ (перезапись), иначе setdefault
+    не обновит ключ, уже объявленный в среде запуска пустой строкой."""
     if not env_path.exists(): return
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line: continue
         key, value = line.split("=", maxsplit=1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        os.environ[key.strip()] = value.strip().strip("'\"")
 
 def _require_non_empty(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -51,8 +60,34 @@ def _parse_trial_days(raw_value: str) -> int:
     if val <= 0: raise ConfigError("TRIAL_DAYS must be greater than zero.")
     return val
 
+def _xui_inbound_tag() -> str:
+    v = os.getenv("XUI_INBOUND_TAG", "").strip()
+    return v if v else "vless_reality"
+
+def _xui_inbound_id() -> int | None:
+    v = os.getenv("XUI_INBOUND_ID", "").strip()
+    if not v:
+        return None
+    try:
+        n = int(v)
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+def _resolve_env_path(env_file: str | Path) -> Path:
+    p = Path(env_file)
+    return p if p.is_absolute() else _PROJECT_ROOT / p
+
+
 def load_settings(env_file: str | Path = ".env") -> Settings:
-    _load_dotenv_file(Path(env_file))
+    env_path = _resolve_env_path(env_file)
+    if not env_path.exists():
+        LOGGER.warning(
+            "Файл %s не найден (cwd=%s). Переменные только из окружения процесса.",
+            env_path,
+            Path.cwd(),
+        )
+    _load_dotenv_file(env_path)
     missing = [n for n in REQUIRED_ENV_VARS if not os.getenv(n, "").strip()]
     if missing: raise ConfigError(f"Missing required env var(s): {', '.join(missing)}.")
     return Settings(
@@ -60,6 +95,8 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         xui_api_url=_require_non_empty("XUI_API_URL"),
         xui_username=_require_non_empty("XUI_USERNAME"),
         xui_password=_require_non_empty("XUI_PASSWORD"),
+        xui_inbound_tag=_xui_inbound_tag(),
+        xui_inbound_id=_xui_inbound_id(),
         admin_ids=_parse_admin_ids(_require_non_empty("ADMIN_IDS")),
         trial_days=_parse_trial_days(_require_non_empty("TRIAL_DAYS")),
         db_path=_require_non_empty("DB_PATH"),

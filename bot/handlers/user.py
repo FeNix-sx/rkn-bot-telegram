@@ -18,6 +18,7 @@ LOGGER = logging.getLogger(__name__)
 router = Router()
 
 PENDING_TRIALS: dict[int, dict] = {}
+PENDING_NEW_USERS: dict[int, dict] = {}
 
 def _fmt(dt):
     if not dt: return "n/a"
@@ -59,7 +60,10 @@ async def _issue_trial_now(
             vpn_issued_by_tg_id=vpn_issued_by_tg_id,
         )
         return url
-    inbound_id = await xui_api.resolve_inbound_id("vless_reality")
+    inbound_id = await xui_api.resolve_target_inbound_id(
+        numeric_id=settings.xui_inbound_id,
+        tag=settings.xui_inbound_tag,
+    )
     await xui_api.add_client(inbound_id, email, uuid_val, limit_ip=1)
     url = await xui_api.build_or_get_subscription_url(inbound_id=inbound_id, email=email)
     await users_repo.set_trial(
@@ -77,18 +81,55 @@ async def _issue_trial_now(
 async def start(msg: Message, settings: Settings, users_repo: UsersRepository, bot: Bot):
     tg = msg.from_user
     if not tg: return
-    name = tg.username or tg.first_name or "Без имени"
-    txt = f"🆔 /start:\nID: {tg.id}\nИмя: {name}"
+    row = await users_repo.get_user(tg.id)
+    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
+
+    if tg.id in settings.admin_ids:
+        created = await users_repo.create_user_if_not_exists(tg.id, tg.username, tg.first_name, tg.last_name)
+        text = "Привет! Профиль создан." if created else "Бот активирован"
+        await msg.answer(text, reply_markup=reply_menu(True))
+        return
+
+    if row:
+        await msg.answer("Бот активирован", reply_markup=reply_menu(is_adm))
+        return
+
+    if tg.id in PENDING_NEW_USERS:
+        await msg.answer(
+            "⏳ Запрос уже отправлен. Дождись подтверждения администратора.",
+            reply_markup=reply_menu(False),
+        )
+        return
+
+    PENDING_NEW_USERS[tg.id] = {
+        "username": tg.username,
+        "first_name": tg.first_name,
+        "last_name": tg.last_name,
+    }
+    display_name = tg.username or tg.first_name or "Без имени"
+    admin_txt = (
+        "Новый пользователь активировал бота.\n\n"
+        f"🆔 /start:\nИмя: {display_name}\nID: {tg.id}"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да", callback_data=f"start:approve:{tg.id}"),
+                InlineKeyboardButton(text="❌ Нет", callback_data=f"start:deny:{tg.id}"),
+            ],
+        ]
+    )
     admins = set(settings.admin_ids)
     admins.update(await users_repo.get_all_dynamic_admins())
     for aid in admins:
-        try: await bot.send_message(aid, txt)
-        except: pass
-    await users_repo.create_user_if_not_exists(tg.id, tg.username, tg.first_name, tg.last_name)
-    row = await users_repo.get_user(tg.id)
-    st = row.get("status", "new") if row else "new"
-    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
-    await msg.answer(f"{'Привет! Профиль создан.' if row else 'С возвращением!'}\nСтатус: {st}\n\n/trial - триал\n/status - статус\n/link - ссылка", reply_markup=reply_menu(is_adm))
+        try:
+            await bot.send_message(aid, admin_txt, reply_markup=kb)
+        except Exception:
+            pass
+    await msg.answer(
+        "⏳ Запрос отправлен администратору. Дождись подтверждения доступа.",
+        reply_markup=reply_menu(False),
+    )
 
 @router.message(Command("status"))
 @router.message(F.text == "📊 Мой статус")
@@ -103,7 +144,16 @@ async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
     tg = msg.from_user
     if not tg: return
     row = await users_repo.get_user(tg.id)
-    if not row: return await msg.answer("Ошибка.", reply_markup=reply_menu())
+    if not row:
+        if tg.id in PENDING_NEW_USERS:
+            return await msg.answer(
+                "⏳ Сначала дождись подтверждения регистрации (/start).",
+                reply_markup=reply_menu(False),
+            )
+        return await msg.answer(
+            "Сначала /start и подтверждение администратора.",
+            reply_markup=reply_menu(False),
+        )
     url = (row.get("subscription_url") or "").strip()
     if not url: return await msg.answer("Нет ссылки. Запусти /trial.", reply_markup=reply_menu())
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
@@ -115,6 +165,16 @@ async def cmd_trial(msg: Message, settings: Settings, users_repo: UsersRepositor
     tg = msg.from_user
     if not tg: return
     row = await users_repo.get_user(tg.id)
+    if not row:
+        if tg.id in PENDING_NEW_USERS:
+            return await msg.answer(
+                "⏳ Сначала дождись подтверждения регистрации (/start).",
+                reply_markup=reply_menu(False),
+            )
+        return await msg.answer(
+            "Сначала нажми /start и дождись подтверждения администратора.",
+            reply_markup=reply_menu(False),
+        )
     active, end_date = _is_sub_active(row)
     if active:
         await msg.answer(f"🚫 Подписка уже активирована.\n📅 Истекает: `{_fmt(end_date)}`", parse_mode="Markdown", reply_markup=reply_menu())

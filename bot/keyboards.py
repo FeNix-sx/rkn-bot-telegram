@@ -13,8 +13,9 @@ def reply_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
 def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Привязанные", callback_data="admin:bound")],
-        [InlineKeyboardButton(text="🔗 Непривязанные", callback_data="admin:unbound")],
-        [InlineKeyboardButton(text="❓ Не в базе", callback_data="admin:unknown")],
+        [InlineKeyboardButton(text="🔗 Нет аккаунта ТГ", callback_data="admin:unbound")],
+        [InlineKeyboardButton(text="❓ Нет клиента VPN", callback_data="admin:unknown")],
+        [InlineKeyboardButton(text="➕ Добавить клиент", callback_data="xui:add:panel")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin:panel_back")],
     ])
 

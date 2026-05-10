@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import secrets
+import string
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 import httpx
 
 LOGGER = logging.getLogger(__name__)
@@ -13,6 +15,12 @@ LOGGER = logging.getLogger(__name__)
 class XUIAPIError(RuntimeError):
     """Raised when 3x-ui API call fails."""
     pass
+
+
+def _generate_sub_id(length: int = 16) -> str:
+    """Как в панели: короткий токен для /sub/<subId>."""
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 class XUIAPI:
     """Async client for 3x-ui panel API (session-based auth)."""
@@ -66,7 +74,10 @@ class XUIAPI:
         attempt = 0
         while True:
             try:
-                resp = await self._client.request(method, path, json=json_body)
+                req_kw: dict[str, Any] = {}
+                if json_body is not None:
+                    req_kw["json"] = json_body
+                resp = await self._client.request(method, path, **req_kw)
                 if resp.status_code == 401 and attempt == 0:
                     LOGGER.warning("xui.session.expired, relogin...")
                     self._is_ready = False
@@ -98,24 +109,101 @@ class XUIAPI:
         return [dict(item) for item in resp_obj]
 
     async def resolve_inbound_id(self, tag_or_remark: str = "vless_reality") -> int:
-        target = tag_or_remark.strip().lower()
+        target = (tag_or_remark or "").strip().lower()
+        if not target:
+            raise XUIAPIError("Empty inbound tag/remark.")
         inbounds = await self.get_inbounds()
-        matches = [
-            ib for ib in inbounds
-            if target in {str(ib.get("tag") or "").strip().lower(), str(ib.get("remark") or "").strip().lower()}
-        ]
-        if not matches: raise XUIAPIError(f"Inbound '{tag_or_remark}' not found.")
-        if len(matches) > 1: raise XUIAPIError(f"Inbound '{tag_or_remark}' is ambiguous.")
+        exact: list[dict[str, Any]] = []
+        substr: list[dict[str, Any]] = []
+        for ib in inbounds:
+            tag = str(ib.get("tag") or "").strip().lower()
+            remark = str(ib.get("remark") or "").strip().lower()
+            if tag == target or remark == target:
+                exact.append(ib)
+            elif target in tag or target in remark:
+                substr.append(ib)
+        matches = exact if exact else substr
+        if not matches:
+            labels = [
+                f"id={ib.get('id')} tag={ib.get('tag')!r} remark={ib.get('remark')!r}"
+                for ib in inbounds[:20]
+            ]
+            hint = "; ".join(labels) if labels else "inbounds пусто"
+            raise XUIAPIError(
+                f"Inbound {tag_or_remark!r} не найден. Укажи в .env XUI_INBOUND_TAG точный remark или tag из панели "
+                f"(или уникальную подстроку). Сейчас в панели: {hint}"
+            )
+        if len(matches) > 1:
+            raise XUIAPIError(
+                f"Inbound {tag_or_remark!r} неоднозначен ({len(matches)} совпадений). Задай более точный XUI_INBOUND_TAG."
+            )
         inbound_id = matches[0].get("id")
-        if not isinstance(inbound_id, int): raise XUIAPIError("Inbound id type error.")
+        if not isinstance(inbound_id, int):
+            raise XUIAPIError("Inbound id type error.")
         return inbound_id
 
-    async def add_client(self, inbound_id: int, email: str, uuid: str, limit_ip: int = 0, total_gb: int = 0, expiry_ms: int = 0) -> None:
-        payload = {
-            "id": inbound_id,
-            "settings": json.dumps({"clients": [{"id": uuid, "email": email, "limitIp": limit_ip, "enable": True, "totalGB": total_gb, "expiryTime": expiry_ms}]}),
+    async def resolve_target_inbound_id(self, *, numeric_id: int | None, tag: str) -> int:
+        """Если задан numeric_id (из панели) — только он; иначе поиск по tag/remark."""
+        if numeric_id is not None:
+            for ib in await self.get_inbounds():
+                rid = ib.get("id")
+                if rid is None:
+                    continue
+                try:
+                    if int(rid) == numeric_id:
+                        return numeric_id
+                except (TypeError, ValueError):
+                    continue
+            raise XUIAPIError(f"Inbound с id={numeric_id} не найден в панели.")
+        return await self.resolve_inbound_id(tag)
+
+    async def add_client(
+        self,
+        inbound_id: int,
+        email: str,
+        uuid: str,
+        *,
+        limit_ip: int = 0,
+        total_gb: int = 0,
+        expiry_ms: int = 0,
+        flow: str = "",
+        tg_id: str = "",
+        comment: str = "",
+        sub_id: str = "",
+    ) -> None:
+        client: dict[str, Any] = {
+            "id": uuid,
+            "email": email,
+            "limitIp": limit_ip,
+            "enable": True,
+            "totalGB": total_gb,
+            "expiryTime": expiry_ms,
+            "tgId": tg_id,
         }
+        if flow:
+            client["flow"] = flow
+        if comment:
+            client["comment"] = comment
+        sid = (sub_id or "").strip()
+        client["subId"] = sid if sid else _generate_sub_id()
+        payload = {"id": inbound_id, "settings": json.dumps({"clients": [client]})}
         await self._request("POST", "/panel/api/inbounds/addClient", json_body=payload)
+
+    async def delete_client_by_email(self, inbound_id: int, email: str) -> None:
+        """POST /panel/api/inbounds/:id/delClientByEmail/:email (3x-ui MHSanaei)."""
+        enc = quote((email or "").strip(), safe="")
+        await self._request("POST", f"/panel/api/inbounds/{inbound_id}/delClientByEmail/{enc}")
+
+    async def inbound_has_client_email(self, email: str) -> bool:
+        """True, если клиент с таким email уже есть в любом inbound."""
+        target = (email or "").strip()
+        if not target:
+            return False
+        try:
+            await self.find_inbound_id_for_email(target)
+            return True
+        except XUIAPIError:
+            return False
 
     async def find_inbound_id_for_email(self, email: str) -> int:
         target = (email or "").strip()
@@ -243,11 +331,13 @@ class XUIAPI:
     async def build_or_get_subscription_url(self, *, inbound_id: int, email: str) -> str:
         settings = await self._get_inbound_settings(inbound_id)
         clients = settings.get("clients", [])
+        target = (email or "").strip()
         sub_id = None
         for c in clients:
-            if c.get("email") == email:
+            if str(c.get("email") or "").strip() == target:
                 sub_id = str(c.get("subId") or "").strip()
                 break
-        if not sub_id: raise XUIAPIError("subId not found.")
+        if not sub_id:
+            raise XUIAPIError("subId not found (клиент без subId в настройках inbound).")
         parsed = urlparse(self._base_url)
         return f"{parsed.scheme}://{parsed.netloc}/sub/{sub_id}"
