@@ -18,6 +18,7 @@ from core.xui_api import XUIAPI, XUIAPIError
 from core.config import Settings
 from db.repositories.users_repo import UsersRepository
 from db.database import utc_now_iso
+from bot.callback_edit import edit_callback_nav
 from bot.handlers.user import PENDING_TRIALS, PENDING_NEW_USERS, _issue_trial_now
 from bot.handlers.stats import _admin_display, _get_client_info, _gb
 
@@ -225,6 +226,11 @@ def _back_to_unbound_panel_kb(email: str, list_page: int) -> InlineKeyboardMarku
 async def _is_admin(tg_id: int, settings: Settings, users_repo: UsersRepository) -> bool:
     return tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
 
+
+async def _edit_admin_nav(cb: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup) -> None:
+    """Одно сообщение админки: меняем текст и клавиатуру вместо нового сообщения."""
+    await edit_callback_nav(cb, text, reply_markup)
+
 def _btn_user_label(username: str | None, tg_id: int, max_len: int = 22) -> str:
     raw = (username or "").strip() or f"ID:{tg_id}"
     return raw if len(raw) <= max_len else raw[: max_len - 1] + "…"
@@ -342,7 +348,7 @@ async def admin_main_cb(cb: CallbackQuery, settings: Settings, users_repo: Users
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
     await cb.answer()
-    await cb.message.answer("⚙️ Управление:", reply_markup=admin_menu())
+    await _edit_admin_nav(cb, "⚙️ Управление:", admin_menu())
 
 
 @router.callback_query(F.data == "admin:panel_back")
@@ -373,7 +379,7 @@ async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRe
             ) as cur:
                 users = await cur.fetchall()
         if not users:
-            return await cb.message.answer("📭 Пусто.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "📭 Пусто.", back_admin())
         inbounds = await xui_api.get_inbounds()
         enable_by_email = _email_enable_map_from_inbounds(inbounds)
         admin_short_cache: dict[int | None, str] = {}
@@ -417,14 +423,15 @@ async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRe
         if nav:
             kb.append(nav)
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
-        await cb.message.answer(
+        await _edit_admin_nav(
+            cb,
             f"👥 Пользователи (стр. {page + 1}/{total_pages}):\n\n"
             "Пользователи с Telegram, у которых в боте указан клиент 3X-UI (полная связка ТГ ↔ VPN).",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+            InlineKeyboardMarkup(inline_keyboard=kb),
         )
     except Exception as e:
         LOGGER.exception("admin.bound.error")
-        await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
 
 @router.callback_query(F.data.startswith("bound:user:"))
 async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
@@ -469,7 +476,7 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
             [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")],
         ]
     )
-    await cb.message.answer(head + "\n\nНастройки (заглушки):", reply_markup=kb)
+    await _edit_admin_nav(cb, head + "\n\nНастройки (заглушки):", kb)
 
 
 @router.callback_query(F.data.startswith("bound:vpn_link:"))
@@ -479,14 +486,16 @@ async def bound_vpn_link(cb: CallbackQuery, settings: Settings, users_repo: User
     parts = cb.data.split(":")
     if len(parts) < 4:
         return await cb.answer("Ошибка данных", show_alert=True)
-    tg_id = int(parts[2])
+    tg_id, list_page = int(parts[2]), int(parts[3])
     await cb.answer()
     row = await users_repo.get_user(tg_id)
     email = (row.get("xui_email") or "").strip() if row else ""
     un = (row.get("username") or "").strip().lstrip("@") if row else ""
     client_label = f"@{un}" if un else (email or f"ID:{tg_id}")
     if not email:
-        return await cb.message.answer("❌ Нет привязки к клиенту панели (xui_email).", reply_markup=back_admin())
+        return await _edit_admin_nav(
+            cb, "❌ Нет привязки к клиенту панели (xui_email).", _back_to_bound_user_kb(tg_id, list_page)
+        )
     try:
         await _send_vpn_link_to_admin(
             cb,
@@ -496,7 +505,7 @@ async def bound_vpn_link(cb: CallbackQuery, settings: Settings, users_repo: User
             settings=settings,
         )
     except Exception as e:
-        await cb.message.answer(f"❌ Не удалось получить ссылку: {e}")
+        await _edit_admin_nav(cb, f"❌ Не удалось получить ссылку: {e}", _back_to_bound_user_kb(tg_id, list_page))
 
 
 @router.callback_query(F.data.startswith("bound:claim_steward:"))
@@ -524,10 +533,11 @@ async def bound_claim_steward(cb: CallbackQuery, settings: Settings, users_repo:
         filled.append("одобрение")
     if vp is None:
         filled.append("VPN")
-    await cb.message.answer(
+    await _edit_admin_nav(
+        cb,
         f"👤 {tg_id}: записал тебя в: {', '.join(filled)}.\n"
         f"Открой карточку снова из списка пользователей (стр. {list_page + 1}), чтобы увидеть строки.",
-        reply_markup=InlineKeyboardMarkup(
+        InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 К карточке", callback_data=f"bound:user:{tg_id}:{list_page}")],
             ]
@@ -553,7 +563,7 @@ async def bound_iplimit_flow(
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row or not (row.get("xui_email") or "").strip():
-            return await cb.message.answer("❌ Нет привязки к панели.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Нет привязки к панели.", back_admin())
         nums = [
             InlineKeyboardButton(text=str(n), callback_data=f"bound:iplimit:set:{tg_id}:{list_page}:{n}")
             for n in (1, 2, 3, 4, 5)
@@ -564,7 +574,7 @@ async def bound_iplimit_flow(
                 [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
             ]
         )
-        return await cb.message.answer("Лимит одновременных подключений (IP limit), значение 1–5:", reply_markup=kb)
+        return await _edit_admin_nav(cb, "Лимит одновременных подключений (IP limit), значение 1–5:", kb)
     if kind == "set":
         if len(parts) < 6:
             return await cb.answer("Ошибка данных", show_alert=True)
@@ -574,10 +584,10 @@ async def bound_iplimit_flow(
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден.", back_admin())
         email = (row.get("xui_email") or "").strip()
         if not email:
-            return await cb.message.answer("❌ Нет xui_email.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Нет xui_email.", _back_to_bound_user_kb(tg_id, list_page))
         try:
             if os.getenv("MOCK_XUI"):
                 txt = f"✅ MOCK: limitIp={lim} для {email}"
@@ -588,9 +598,10 @@ async def bound_iplimit_flow(
         except Exception as e:
             LOGGER.exception("iplimit.set.error")
             txt = f"❌ {e}"
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             txt,
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")]
                 ]
@@ -617,9 +628,10 @@ async def bound_renew_flow(
         list_page = int(parts[3]) if len(parts) > 3 else 0
         await state.clear()
         await cb.answer("Отменено")
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             "Продление отменено.",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")]
                 ]
@@ -638,18 +650,19 @@ async def bound_renew_flow(
                 [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bound:renew:cancel:{list_page}")],
             ]
         )
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             f"Продление подписки для {tg_id}.\n\n"
             "Отправь дату окончания: ДД.ММ.ГГГГ (до 23:59:59 UTC этого дня), "
             "или нажми «На 1 месяц».",
-            reply_markup=kb,
+            kb,
         )
     if kind == "1m":
         await state.clear()
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден.", back_admin())
         now = datetime.now(timezone.utc)
         end_dt = _sub_end_datetime(row)
         if end_dt and end_dt > now:
@@ -661,9 +674,10 @@ async def bound_renew_flow(
         except Exception as e:
             LOGGER.exception("renew.1m.error")
             txt = f"❌ {e}"
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             txt,
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")]
                 ]
@@ -740,11 +754,12 @@ async def bound_grant_admin_flow(cb: CallbackQuery, settings: Settings, users_re
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден в БД.", back_admin())
         if await _already_admin(tg_id):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "ℹ️ У этого пользователя уже есть права администратора.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         label = _btn_user_label(row.get("username"), tg_id, max_len=36)
         kb = InlineKeyboardMarkup(
@@ -756,30 +771,33 @@ async def bound_grant_admin_flow(cb: CallbackQuery, settings: Settings, users_re
                 [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
             ]
         )
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             f"Выдать пользователю «{label}» (id: {tg_id}) права администратора в боте?",
-            reply_markup=kb,
+            kb,
         )
 
     if action == "yes":
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден.", back_admin())
         if await _already_admin(tg_id):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "ℹ️ Уже администратор, изменения не требуются.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         await users_repo.set_admin(tg_id, True)
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             "✅ Пользователю выданы права администратора.",
-            reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            _back_to_bound_user_kb(tg_id, list_page),
         )
 
     if action == "no":
         await cb.answer("Отменено")
-        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        return await _edit_admin_nav(cb, "Действие отменено.", _back_to_bound_user_kb(tg_id, list_page))
 
     return await cb.answer("Неизвестное действие", show_alert=True)
 
@@ -797,16 +815,18 @@ async def bound_revoke_admin_flow(cb: CallbackQuery, settings: Settings, users_r
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден в БД.", back_admin())
         if tg_id in settings.admin_ids:
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "⚠️ Этот ID указан в ADMIN_IDS в конфиге бота. Снять такие права можно только убрав id из конфига и перезапустив бота.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         if not await users_repo.is_admin(tg_id):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "ℹ️ У пользователя нет прав администратора в базе.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         label = _btn_user_label(row.get("username"), tg_id, max_len=36)
         kb = InlineKeyboardMarkup(
@@ -818,35 +838,39 @@ async def bound_revoke_admin_flow(cb: CallbackQuery, settings: Settings, users_r
                 [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
             ]
         )
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             f"Снять у пользователя «{label}» (id: {tg_id}) права администратора в боте (запись в БД)?",
-            reply_markup=kb,
+            kb,
         )
 
     if action == "yes":
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден.", back_admin())
         if tg_id in settings.admin_ids:
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "⚠️ ID в ADMIN_IDS — снятие через бота невозможно, правь конфиг.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         if not await users_repo.is_admin(tg_id):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "ℹ️ Уже без прав администратора в БД.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         await users_repo.set_admin(tg_id, False)
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             "✅ Права администратора в базе сняты.",
-            reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+            _back_to_bound_user_kb(tg_id, list_page),
         )
 
     if action == "no":
         await cb.answer("Отменено")
-        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        return await _edit_admin_nav(cb, "Действие отменено.", _back_to_bound_user_kb(tg_id, list_page))
 
     return await cb.answer("Неизвестное действие", show_alert=True)
 
@@ -889,16 +913,18 @@ async def bound_xui_toggle_flow(
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден в БД.", back_admin())
         email = (row.get("xui_email") or "").strip()
         if not email:
-            return await cb.message.answer("❌ Нет привязки к панели (xui_email).", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+            return await _edit_admin_nav(
+                cb, "❌ Нет привязки к панели (xui_email).", _back_to_bound_user_kb(tg_id, list_page)
+            )
         cur = await _fetch_enabled(email)
         if cur is not None:
             if verb_off and not cur:
-                return await cb.message.answer(already, reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+                return await _edit_admin_nav(cb, already, _back_to_bound_user_kb(tg_id, list_page))
             if not verb_off and cur:
-                return await cb.message.answer(already, reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+                return await _edit_admin_nav(cb, already, _back_to_bound_user_kb(tg_id, list_page))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -908,20 +934,21 @@ async def bound_xui_toggle_flow(
                 [InlineKeyboardButton(text="🔙 К карточке пользователя", callback_data=f"bound:user:{tg_id}:{list_page}")],
             ]
         )
-        return await cb.message.answer(q, reply_markup=kb)
+        return await _edit_admin_nav(cb, q, kb)
 
     if action == "yes":
         await cb.answer()
         row = await users_repo.get_user(tg_id)
         if not row:
-            return await cb.message.answer("❌ Пользователь не найден.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Пользователь не найден.", back_admin())
         email = (row.get("xui_email") or "").strip()
         if not email:
-            return await cb.message.answer("❌ Нет xui_email.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+            return await _edit_admin_nav(cb, "❌ Нет xui_email.", _back_to_bound_user_kb(tg_id, list_page))
         if os.getenv("MOCK_XUI"):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 f"✅ MOCK: клиент «{email}» {'отключён' if verb_off else 'включён'}.",
-                reply_markup=_back_to_bound_user_kb(tg_id, list_page),
+                _back_to_bound_user_kb(tg_id, list_page),
             )
         try:
             iid = await xui_api.find_inbound_id_for_email(email)
@@ -931,12 +958,12 @@ async def bound_xui_toggle_flow(
                 await xui_api.enable_client(iid, email)
         except Exception as e:
             LOGGER.exception("xui_toggle.apply")
-            return await cb.message.answer(f"❌ {e}", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
-        return await cb.message.answer(done, reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+            return await _edit_admin_nav(cb, f"❌ {e}", _back_to_bound_user_kb(tg_id, list_page))
+        return await _edit_admin_nav(cb, done, _back_to_bound_user_kb(tg_id, list_page))
 
     if action == "no":
         await cb.answer("Отменено")
-        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_bound_user_kb(tg_id, list_page))
+        return await _edit_admin_nav(cb, "Действие отменено.", _back_to_bound_user_kb(tg_id, list_page))
 
     return await cb.answer("Неизвестное действие", show_alert=True)
 
@@ -952,11 +979,11 @@ async def bound_stub_echo(cb: CallbackQuery, settings: Settings, users_repo: Use
     seg = cb.data.split(":")
     if len(seg) < 4:
         await cb.answer()
-        return await cb.message.answer(f"🔧 Заглушка (raw): {cb.data}")
+        return await _edit_admin_nav(cb, f"🔧 Заглушка (raw): {cb.data}", back_admin())
     action, tg_s = seg[2], seg[3]
     label = _STUB_LABELS.get(action, action)
     await cb.answer()
-    await cb.message.answer(f"🔧 Заглушка: {label}\ntg_id: {tg_s}\nraw: {cb.data}")
+    await _edit_admin_nav(cb, f"🔧 Заглушка: {label}\ntg_id: {tg_s}\nraw: {cb.data}", back_admin())
 
 
 @router.callback_query(F.data == "xui:add:panel")
@@ -966,10 +993,11 @@ async def xui_add_panel_start(cb: CallbackQuery, state: FSMContext, settings: Se
     await state.set_state(XuiAddClient.waiting_email)
     await state.update_data(kind="panel")
     await cb.answer()
-    await cb.message.answer(
+    await _edit_admin_nav(
+        cb,
         "Вариант Б: только 3X-UI (в боте строки не будет → потом «Нет аккаунта ТГ 📥»).\n\n"
         "Отправь логин для поля Email в панели (префикс «@» не обязателен).",
-        reply_markup=_xui_add_cancel_kb(),
+        _xui_add_cancel_kb(),
     )
 
 
@@ -991,7 +1019,7 @@ async def xui_add_db_start(
     await cb.answer()
     row = await users_repo.get_user(tg_id)
     if not row:
-        return await cb.message.answer("❌ Пользователь не найден в БД.", reply_markup=back_admin())
+        return await _edit_admin_nav(cb, "❌ Пользователь не найден в БД.", back_admin())
     suggested = _suggested_email_variant_a(row)
     issuer = cb.from_user
     comment = _issuer_comment(issuer)
@@ -999,9 +1027,10 @@ async def xui_add_db_start(
     if not suggested:
         await state.set_state(XuiAddClient.waiting_email)
         await state.update_data(kind="db", target_tg_id=tg_id)
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             "Нет @username в Telegram. Введи email для панели с ведущим @.",
-            reply_markup=_xui_add_cancel_kb(),
+            _xui_add_cancel_kb(),
         )
 
     if not os.getenv("MOCK_XUI"):
@@ -1009,13 +1038,14 @@ async def xui_add_db_start(
             if await xui_api.inbound_has_client_email(suggested):
                 await state.set_state(XuiAddClient.waiting_email)
                 await state.update_data(kind="db", target_tg_id=tg_id)
-                return await cb.message.answer(
+                return await _edit_admin_nav(
+                    cb,
                     f"Email `{suggested}` уже занят в панели. Пришли другой (с ведущим @).",
-                    reply_markup=_xui_add_cancel_kb(),
+                    _xui_add_cancel_kb(),
                 )
         except XUIAPIError as e:
             LOGGER.exception("xui.add.email_check")
-            return await cb.message.answer(f"❌ Панель: {e}", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, f"❌ Панель: {e}", back_admin())
 
     start, end, expiry_ms = _trial_window_3d()
     uuid_val = str(uuid4())
@@ -1033,7 +1063,7 @@ async def xui_add_db_start(
         )
     except Exception as e:
         LOGGER.exception("xui.add.create")
-        return await cb.message.answer(f"❌ {e}", reply_markup=back_admin())
+        return await _edit_admin_nav(cb, f"❌ {e}", back_admin())
 
     await users_repo.set_trial(
         tg_id,
@@ -1053,9 +1083,10 @@ async def xui_add_db_start(
         )
     except Exception:
         LOGGER.exception("xui.add.notify_user")
-    await cb.message.answer(
+    await _edit_admin_nav(
+        cb,
         f"✅ Клиент в 3X-UI и БД: `{suggested}` → tg_id `{tg_id}`\n🔗 {url}",
-        reply_markup=back_admin(),
+        back_admin(),
     )
 
 
@@ -1065,7 +1096,7 @@ async def xui_add_cancel(cb: CallbackQuery, state: FSMContext, settings: Setting
         return await cb.answer("🚫", show_alert=True)
     await state.clear()
     await cb.answer("Отменено")
-    await cb.message.answer("Создание клиента отменено.", reply_markup=back_admin())
+    await _edit_admin_nav(cb, "⚙️ Управление:", admin_menu())
 
 
 @router.message(StateFilter(XuiAddClient.waiting_email), F.text)
@@ -1208,10 +1239,11 @@ async def admin_unbound(cb: CallbackQuery, settings: Settings, users_repo: Users
                         panel_rows.append({"email": email, "up": 0})
                         seen_panel.add(email)
         if not panel_rows:
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "✅ Нет клиентов 3X-UI без привязки к Telegram в боте.\n\n"
                 "Пользователей только из бота без VPN смотри в «Нет клиента VPN 🔌».",
-                reply_markup=back_admin(),
+                back_admin(),
             )
         total = len(panel_rows)
         page_size = 7
@@ -1232,14 +1264,15 @@ async def admin_unbound(cb: CallbackQuery, settings: Settings, users_repo: Users
         if page < total_pages - 1: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin:unbound:page:{page+1}"))
         if nav: kb.append(nav)
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
-        await cb.message.answer(
+        await _edit_admin_nav(
+            cb,
             f"Нет аккаунта ТГ 📥 (стр. {page + 1}/{total_pages}):\n\n"
             "Клиенты в 3X-UI, у которых в боте нет привязанного Telegram.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+            InlineKeyboardMarkup(inline_keyboard=kb),
         )
     except Exception as e:
         LOGGER.exception("admin.unbound.error")
-        await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
 
 
 @router.callback_query(F.data.startswith("unbound:panel:menu:"))
@@ -1257,7 +1290,7 @@ async def unbound_panel_client_menu(
         inbounds = await xui_api.get_inbounds()
     except Exception as e:
         LOGGER.exception("unbound.panel.inbounds")
-        return await cb.message.answer(f"❌ {e}", reply_markup=back_admin())
+        return await _edit_admin_nav(cb, f"❌ {e}", back_admin())
     up, down = _traffic_up_down_for_email(inbounds, email)
     info = await _get_client_info(xui_api, email)
     exp_ms = int(info.get("expiry_ms") or 0)
@@ -1309,7 +1342,7 @@ async def unbound_panel_client_menu(
             [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:unbound:page:{list_page}")],
         ]
     )
-    await cb.message.answer(head + "\n\nНастройки (заглушки):", reply_markup=kb)
+    await _edit_admin_nav(cb, head + "\n\nНастройки (заглушки):", kb)
 
 
 @router.callback_query(F.data.startswith("unbound:vpn_link:"))
@@ -1330,7 +1363,7 @@ async def unbound_vpn_link(cb: CallbackQuery, settings: Settings, users_repo: Us
             settings=settings,
         )
     except Exception as e:
-        await cb.message.answer(f"❌ Не удалось получить ссылку: {e}")
+        await _edit_admin_nav(cb, f"❌ Не удалось получить ссылку: {e}", _back_to_unbound_panel_kb(email, list_page))
 
 
 @router.callback_query(F.data.startswith("unbound:iplimit:"))
@@ -1353,9 +1386,10 @@ async def unbound_iplimit_flow(
         list_page, email = parsed
         await cb.answer()
         if await _xui_email_bound_in_db(users_repo, email):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 f"❌ `{email}` уже привязан в БД — открой карточку из «Пользователи».",
-                reply_markup=back_admin(),
+                back_admin(),
             )
         nums = [
             InlineKeyboardButton(text=str(n), callback_data=f"unbound:iplimit:set:{list_page}:{email}:{n}")
@@ -1372,7 +1406,7 @@ async def unbound_iplimit_flow(
                 ],
             ]
         )
-        return await cb.message.answer("Лимит одновременных подключений (IP limit), значение 1–5:", reply_markup=kb)
+        return await _edit_admin_nav(cb, "Лимит одновременных подключений (IP limit), значение 1–5:", kb)
     if kind == "set":
         if len(parts) < 6:
             return await cb.answer("Ошибка данных", show_alert=True)
@@ -1385,9 +1419,10 @@ async def unbound_iplimit_flow(
             return await cb.answer("Только 1–5", show_alert=True)
         await cb.answer()
         if await _xui_email_bound_in_db(users_repo, email):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 f"❌ `{email}` уже привязан в БД.",
-                reply_markup=back_admin(),
+                back_admin(),
             )
         try:
             if os.getenv("MOCK_XUI"):
@@ -1399,7 +1434,7 @@ async def unbound_iplimit_flow(
         except Exception as e:
             LOGGER.exception("unbound.iplimit.set.error")
             txt = f"❌ {e}"
-        return await cb.message.answer(txt, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+        return await _edit_admin_nav(cb, txt, _back_to_unbound_panel_kb(email, list_page))
     return await cb.answer("Неизвестное действие", show_alert=True)
 
 
@@ -1421,9 +1456,10 @@ async def unbound_renew_flow(
         list_page = int(parts[3]) if len(parts) > 3 else 0
         await state.clear()
         await cb.answer("Отменено")
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             "Продление отменено.",
-            reply_markup=InlineKeyboardMarkup(
+            InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:unbound:page:{list_page}")]
                 ]
@@ -1435,7 +1471,7 @@ async def unbound_renew_flow(
     list_page, email = parsed
     if await _xui_email_bound_in_db(users_repo, email):
         await cb.answer("Уже в БД", show_alert=True)
-        return await cb.message.answer(f"❌ `{email}` привязан — карточка в «Пользователи».", reply_markup=back_admin())
+        return await _edit_admin_nav(cb, f"❌ `{email}` привязан — карточка в «Пользователи».", back_admin())
     if kind == "start":
         await state.set_state(AdminRenew.waiting_manual_date)
         await state.update_data(target_email=email, list_page=list_page, target_tg_id=None)
@@ -1446,11 +1482,12 @@ async def unbound_renew_flow(
                 [InlineKeyboardButton(text="❌ Отмена", callback_data=f"unbound:renew:cancel:{list_page}")],
             ]
         )
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             f"Продление подписки в панели для `{email}` (строка в БД бота не меняется).\n\n"
             "Отправь дату окончания: ДД.ММ.ГГГГ (до 23:59:59 UTC этого дня), "
             "или нажми «На 1 месяц».",
-            reply_markup=kb,
+            kb,
         )
     if kind == "1m":
         await state.clear()
@@ -1467,7 +1504,7 @@ async def unbound_renew_flow(
         except Exception as e:
             LOGGER.exception("unbound.renew.1m.error")
             txt = f"❌ {e}"
-        return await cb.message.answer(txt, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+        return await _edit_admin_nav(cb, txt, _back_to_unbound_panel_kb(email, list_page))
     return await cb.answer("Неизвестное действие", show_alert=True)
 
 
@@ -1490,7 +1527,7 @@ async def unbound_stub_no_tg(cb: CallbackQuery, settings: Settings, users_repo: 
         msg = "ℹ️ Снять админа можно только у пользователя в боте. Сначала привяжи клиента к TG."
     else:
         msg = "ℹ️ «Ответственный админ» пишется в БД по пользователю Telegram. Сначала привяжи клиента к TG."
-    await cb.message.answer(msg, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+    await _edit_admin_nav(cb, msg, _back_to_unbound_panel_kb(email, list_page))
 
 
 @router.callback_query(F.data.startswith("unbound:xui_toggle:"))
@@ -1534,16 +1571,17 @@ async def unbound_xui_toggle_flow(
     if action == "ask":
         await cb.answer()
         if await _xui_email_bound_in_db(users_repo, email):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 f"❌ `{email}` уже в БД — управляй из «Пользователи».",
-                reply_markup=back_admin(),
+                back_admin(),
             )
         cur = await _fetch_enabled(email)
         if cur is not None:
             if verb_off and not cur:
-                return await cb.message.answer(already, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+                return await _edit_admin_nav(cb, already, _back_to_unbound_panel_kb(email, list_page))
             if not verb_off and cur:
-                return await cb.message.answer(already, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+                return await _edit_admin_nav(cb, already, _back_to_unbound_panel_kb(email, list_page))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1562,16 +1600,17 @@ async def unbound_xui_toggle_flow(
                 ],
             ]
         )
-        return await cb.message.answer(q, reply_markup=kb)
+        return await _edit_admin_nav(cb, q, kb)
 
     if action == "yes":
         await cb.answer()
         if await _xui_email_bound_in_db(users_repo, email):
-            return await cb.message.answer("❌ Уже привязан в БД.", reply_markup=back_admin())
+            return await _edit_admin_nav(cb, "❌ Уже привязан в БД.", back_admin())
         if os.getenv("MOCK_XUI"):
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 f"✅ MOCK: клиент «{email}» {'отключён' if verb_off else 'включён'}.",
-                reply_markup=_back_to_unbound_panel_kb(email, list_page),
+                _back_to_unbound_panel_kb(email, list_page),
             )
         try:
             iid = await xui_api.find_inbound_id_for_email(email)
@@ -1581,12 +1620,12 @@ async def unbound_xui_toggle_flow(
                 await xui_api.enable_client(iid, email)
         except Exception as e:
             LOGGER.exception("unbound.xui_toggle.apply")
-            return await cb.message.answer(f"❌ {e}", reply_markup=_back_to_unbound_panel_kb(email, list_page))
-        return await cb.message.answer(done, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+            return await _edit_admin_nav(cb, f"❌ {e}", _back_to_unbound_panel_kb(email, list_page))
+        return await _edit_admin_nav(cb, done, _back_to_unbound_panel_kb(email, list_page))
 
     if action == "no":
         await cb.answer("Отменено")
-        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_unbound_panel_kb(email, list_page))
+        return await _edit_admin_nav(cb, "Действие отменено.", _back_to_unbound_panel_kb(email, list_page))
 
     return await cb.answer("Неизвестное действие", show_alert=True)
 
@@ -1609,10 +1648,11 @@ async def unbound_delete_ask(cb: CallbackQuery, settings: Settings, users_repo: 
             [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:unbound:page:{list_page}")],
         ]
     )
-    await cb.message.answer(
+    await _edit_admin_nav(
+        cb,
         f"⚠️ Удалить клиента `{email}` из 3X-UI безвозвратно?\n"
         "В БД бота он не привязан — строка пользователя не затрагивается.",
-        reply_markup=kb,
+        kb,
     )
 
 
@@ -1632,9 +1672,10 @@ async def unbound_delete_confirm(
     email = parts[3]
     if await _xui_email_bound_in_db(users_repo, email):
         await cb.answer("Уже привязан в БД", show_alert=True)
-        return await cb.message.answer(
+        return await _edit_admin_nav(
+            cb,
             f"❌ Клиент `{email}` привязан к пользователю бота — удаление отменено.",
-            reply_markup=back_admin(),
+            back_admin(),
         )
     await cb.answer("Удаляю…")
     actor = _actor_label(cb.from_user)
@@ -1646,13 +1687,13 @@ async def unbound_delete_confirm(
             await xui_api.delete_client_by_email(iid, email)
     except Exception as e:
         LOGGER.exception("unbound.del.client")
-        return await cb.message.answer(f"❌ {e}", reply_markup=back_admin())
+        return await _edit_admin_nav(cb, f"❌ {e}", back_admin())
     note = (
         f"🗑 Клиент VPN `{email}` удалён из 3X-UI.\n"
         f"Админ: {actor} ({cb.from_user.id if cb.from_user else '—'})"
     )
     await _broadcast_to_admins(bot, settings, users_repo, note)
-    await cb.message.answer("✅ Клиент удалён. Уведомление отправлено всем админам.", reply_markup=back_admin())
+    await _edit_admin_nav(cb, "✅ Клиент удалён. Уведомление отправлено всем админам.", back_admin())
 
 
 @router.callback_query(F.data.startswith("bind:client:"))
@@ -1692,7 +1733,7 @@ async def bind_select_client(cb: CallbackQuery, settings: Settings, users_repo: 
             )
         ]
     )
-    await cb.message.answer(f"🔗 Привязка `{email}` → TG:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await _edit_admin_nav(cb, f"🔗 Привязка `{email}` → TG:", InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data.startswith("bind:do_tg:"))
 async def bind_do_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
@@ -1715,7 +1756,8 @@ async def bind_do_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRep
                 for c in json.loads(s).get("clients", []):
                     if c.get("email") == email: uuid = c.get("id"); break
             if uuid: break
-        if not uuid: return await cb.message.answer("❌ UUID не найден.", reply_markup=back_admin())
+        if not uuid:
+            return await _edit_admin_nav(cb, "❌ UUID не найден.", back_admin())
         now = utc_now_iso()
         async with aiosqlite.connect(users_repo.db_path) as db:
             issuer = cb.from_user.id if cb.from_user else None
@@ -1729,10 +1771,10 @@ async def bind_do_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRep
                     (tg_id, "", email, uuid, "manual", issuer, now, now),
                 )
             await db.commit()
-        await cb.message.answer(f"✅ Привязано: `{tg_id}` ↔ `{email}`", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"✅ Привязано: `{tg_id}` ↔ `{email}`", back_admin())
     except Exception as e:
         LOGGER.exception("bind.do_tg.error")
-        await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
 
 @router.callback_query(F.data == "admin:unknown")
 async def admin_unknown_list(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
@@ -1747,18 +1789,22 @@ async def admin_unknown_list(cb: CallbackQuery, settings: Settings, users_repo: 
                    ORDER BY COALESCE(created_at, '') DESC, tg_id DESC"""
             ) as cur:
                 unknown = await cur.fetchall()
-        if not unknown: return await cb.message.answer("✅ У всех пользователей бота есть клиент VPN в привязке.", reply_markup=back_admin())
+        if not unknown:
+            return await _edit_admin_nav(
+                cb, "✅ У всех пользователей бота есть клиент VPN в привязке.", back_admin()
+            )
         kb = [[InlineKeyboardButton(text=f"🔌 {u['username'] or u['first_name'] or 'ID:' + str(u['tg_id'])} ({u['tg_id']})", callback_data=f"bind:unknown:{u['tg_id']}")] for u in unknown[:10]]
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
-        await cb.message.answer(
+        await _edit_admin_nav(
+            cb,
             "Нет клиента VPN 🔌:\n\n"
             "Пользователь в боте, но в 3X-UI для него ещё не оформлена связка (или xui_email пустой).\n\n"
             "Выбери пользователя:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+            InlineKeyboardMarkup(inline_keyboard=kb),
         )
     except Exception as e:
         LOGGER.exception("admin.unknown.error")
-        await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
 
 @router.callback_query(F.data.startswith("bind:unknown:"))
 async def admin_unknown_select(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
@@ -1787,21 +1833,23 @@ async def admin_unknown_select(cb: CallbackQuery, settings: Settings, users_repo
                 [InlineKeyboardButton(text="➕ Добавить клиент", callback_data=f"xui:add:db:{tg_id}")],
                 [InlineKeyboardButton(text="🔙 Назад", callback_data="admin:unknown")],
             ]
-            return await cb.message.answer(
+            return await _edit_admin_nav(
+                cb,
                 "✅ В панели нет свободных клиентов для привязки.\n\n"
                 "Можно создать нового клиента в 3X-UI кнопкой ниже.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+                InlineKeyboardMarkup(inline_keyboard=kb),
             )
         kb = [[InlineKeyboardButton(text=f"📥 {c['email']}", callback_data=f"bind:do_unknown:{tg_id}:{c['email']}")] for c in unbound_clients[:10]]
         kb.append([InlineKeyboardButton(text="➕ Добавить клиент", callback_data=f"xui:add:db:{tg_id}")])
         kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin:unknown")])
-        await cb.message.answer(
+        await _edit_admin_nav(
+            cb,
             f"🔗 Привязать пользователя `{tg_id}` к клиенту 3X-UI или создать нового:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+            InlineKeyboardMarkup(inline_keyboard=kb),
         )
     except Exception as e:
         LOGGER.exception("admin.unknown_select.error")
-        await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
 
 @router.callback_query(F.data.startswith("bind:do_unknown:"))
 async def bind_unknown_do(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
@@ -1818,7 +1866,8 @@ async def bind_unknown_do(cb: CallbackQuery, settings: Settings, users_repo: Use
                 for c in json.loads(s).get("clients", []):
                     if c.get("email") == target_email: uuid = c.get("id"); break
             if uuid: break
-        if not uuid: return await cb.message.answer("❌ UUID не найден.", reply_markup=back_admin())
+        if not uuid:
+            return await _edit_admin_nav(cb, "❌ UUID не найден.", back_admin())
         now = utc_now_iso()
         async with aiosqlite.connect(users_repo.db_path) as db:
             issuer = cb.from_user.id if cb.from_user else None
@@ -1826,12 +1875,13 @@ async def bind_unknown_do(cb: CallbackQuery, settings: Settings, users_repo: Use
                 "UPDATE users SET xui_email=?, xui_uuid=?, status='active', vpn_issued_by_tg_id=?, updated_at=? WHERE tg_id=?",
                 (target_email, uuid, issuer, now, tg_id),
             )
-            if cur.rowcount == 0: return await cb.message.answer(f"❌ Юзер {tg_id} не найден.", reply_markup=back_admin())
+            if cur.rowcount == 0:
+                return await _edit_admin_nav(cb, f"❌ Юзер {tg_id} не найден.", back_admin())
             await db.commit()
-        await cb.message.answer(f"✅ Привязано: `{tg_id}` ↔ `{target_email}`", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"✅ Привязано: `{tg_id}` ↔ `{target_email}`", back_admin())
     except Exception as e:
         LOGGER.exception("bind.unknown.error")
-        await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=back_admin())
+        await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
 
 # === РЕГИСТРАЦИЯ НОВОГО ПОЛЬЗОВАТЕЛЯ (/start) ===
 @router.callback_query(F.data.startswith("start:approve:"))

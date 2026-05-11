@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
+from bot.callback_edit import edit_callback_nav
 from bot.trial_visibility import user_reply_menu
 from core.xui_api import XUIAPI
 from core.config import Settings
@@ -192,12 +193,13 @@ async def stats_admin_branch(
     mode = parts[2]
     await cb.answer()
     if mode == "root":
-        return await cb.message.answer(
+        return await edit_callback_nav(
+            cb,
             "📊 **Статистика**\n\n"
             "• **Пользователи** — есть в боте и указан клиент 3X-UI.\n"
             "• **Клиенты в панели** — только в 3X-UI, без привязки к Telegram в боте.",
+            _stats_admin_root_kb(),
             parse_mode="Markdown",
-            reply_markup=_stats_admin_root_kb(),
         )
     if mode == "users":
         try:
@@ -209,7 +211,9 @@ async def stats_admin_branch(
                 """) as cur:
                     users = await cur.fetchall()
             if not users:
-                return await cb.message.answer("📭 Нет пользователей с клиентом в панели.", reply_markup=_stats_admin_sub_kb())
+                return await edit_callback_nav(
+                    cb, "📭 Нет пользователей с клиентом в панели.", _stats_admin_sub_kb()
+                )
             inbounds = await xui_api.get_inbounds()
             blocks: list[str] = []
             for u in users[:_STAT_PREVIEW_LIMIT]:
@@ -234,17 +238,18 @@ async def stats_admin_branch(
             if total > _STAT_PREVIEW_LIMIT:
                 tail = f"\n\n_…и ещё {total - _STAT_PREVIEW_LIMIT}. Полный список — «⚙️ Управление» → «👥 Пользователи»._"
             text = head + "\n\n──────────────\n\n".join(blocks) + tail
-            return await cb.message.answer(text, parse_mode="Markdown", reply_markup=_stats_admin_sub_kb())
+            return await edit_callback_nav(cb, text, _stats_admin_sub_kb(), parse_mode="Markdown")
         except Exception as e:
             LOGGER.exception("stats.admin.users.error")
-            return await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=_stats_admin_sub_kb())
+            return await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
     if mode == "panel":
         try:
             emails = await _collect_unbound_panel_emails(settings, users_repo, xui_api)
             if not emails:
-                return await cb.message.answer(
+                return await edit_callback_nav(
+                    cb,
                     "📭 Нет клиентов в панели без привязки к пользователю бота.",
-                    reply_markup=_stats_admin_sub_kb(),
+                    _stats_admin_sub_kb(),
                 )
             inbounds = await xui_api.get_inbounds()
             blocks: list[str] = []
@@ -260,10 +265,10 @@ async def stats_admin_branch(
             if total > _STAT_PREVIEW_LIMIT:
                 tail = f"\n\n_…и ещё {total - _STAT_PREVIEW_LIMIT}. Полный список — «⚙️ Управление» → «📥 Нет аккаунта ТГ»._"
             text = head + "\n\n──────────────\n\n".join(blocks) + tail
-            return await cb.message.answer(text, parse_mode="Markdown", reply_markup=_stats_admin_sub_kb())
+            return await edit_callback_nav(cb, text, _stats_admin_sub_kb(), parse_mode="Markdown")
         except Exception as e:
             LOGGER.exception("stats.admin.panel.error")
-            return await cb.message.answer(f"❌ {type(e).__name__}", reply_markup=_stats_admin_sub_kb())
+            return await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
     return await cb.answer("Неизвестно", show_alert=True)
 
 

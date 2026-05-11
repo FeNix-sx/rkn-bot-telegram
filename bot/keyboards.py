@@ -19,6 +19,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📥 Нет аккаунта ТГ", callback_data="admin:unbound")],
         [InlineKeyboardButton(text="🔌 Нет клиента VPN", callback_data="admin:unknown")],
         [InlineKeyboardButton(text="➕ Добавить клиент", callback_data="xui:add:panel")],
+        [InlineKeyboardButton(text="📊 К статистике", callback_data="stats:admin:root")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin:panel_back")],
     ])
 
