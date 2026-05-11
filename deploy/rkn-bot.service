@@ -1,7 +1,7 @@
-# Пример systemd: скопируй в /etc/systemd/system/rkn-bot.service,
-# поправь пути и пользователя, затем: systemctl daemon-reload && systemctl enable --now rkn-bot
+# Скопировать: cp deploy/rkn-bot.service /etc/systemd/system/
+# Затем: systemctl daemon-reload && systemctl enable --now rkn-bot
 #
-# Важно: при DB_PATH=./data/bot.db каталог data/ считается от WorkingDirectory.
+# Важно: DB_PATH относительно WorkingDirectory (например ./data/...).
 
 [Unit]
 Description=RKN Telegram Bot (aiogram)
@@ -10,13 +10,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# User=rknbot
-# Group=rknbot
+User=rknbot
+Group=rknbot
 WorkingDirectory=/opt/rkn-bot
 Environment=PYTHONUNBUFFERED=1
-# Подхват переменных без кавычек вокруг значений (как в .env)
 EnvironmentFile=-/opt/rkn-bot/.env
-ExecStart=/opt/rkn-bot/.venv/bin/python -m bot
+ExecStart=/opt/rkn-bot/.venv/bin/python -m bot.main
 Restart=always
 RestartSec=5
 

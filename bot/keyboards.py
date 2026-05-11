@@ -1,16 +1,27 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 def reply_menu(is_admin: bool = False, *, show_trial: bool = True) -> ReplyKeyboardMarkup:
-    top = [KeyboardButton(text="📊 Мой статус")]
+    # Базовая раскладка 2x2 (без учёта кнопки триала):
+    # [📊 Мой статус]   [🔗 Моя ссылка]
+    # [📈 Статистика]   [⚙️ Управление]  (только для админов)
+    kb: list[list[KeyboardButton]] = []
     if show_trial:
-        top.insert(0, KeyboardButton(text="🚀 Получить триал"))
-    kb = [
-        top,
-        [KeyboardButton(text="🔗 Моя ссылка")],
-    ]
+        kb.append([KeyboardButton(text="🚀 Получить триал")])
+
+    kb.append(
+        [
+            KeyboardButton(text="📊 Мой статус"),
+            KeyboardButton(text="🔗 Моя ссылка"),
+        ]
+    )
+
     if is_admin:
-        kb[1].append(KeyboardButton(text="📈 Статистика"))
-        kb.append([KeyboardButton(text="⚙️ Управление")])
+        kb.append(
+            [
+                KeyboardButton(text="📈 Статистика"),
+                KeyboardButton(text="⚙️ Управление"),
+            ]
+        )
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, is_persistent=True)
 
 def admin_menu() -> InlineKeyboardMarkup:
@@ -20,7 +31,6 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔌 Нет клиента VPN", callback_data="admin:unknown")],
         [InlineKeyboardButton(text="➕ Добавить клиент", callback_data="xui:add:panel")],
         [InlineKeyboardButton(text="📊 К статистике", callback_data="stats:admin:root")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin:panel_back")],
     ])
 
 def back_admin() -> InlineKeyboardMarkup:

@@ -119,6 +119,13 @@ sudo chown -R rknbot:rknbot /opt/rkn-bot/data
 
 **Готово, если:** путь к БД корректен; после первого запуска нет ошибок доступа к файлу.
 
+Если в логах `attempt to write a readonly database` — файл или каталог `data/` не writable для `User=` из unit (часто БД скопировали под `root`). Исправление:
+
+```bash
+sudo chown -R rknbot:rknbot /opt/rkn-bot/data
+sudo systemctl restart rkn-bot
+```
+
 ---
 
 ## Шаг 6. Ручной прогон (до systemd)

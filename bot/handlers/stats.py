@@ -126,6 +126,64 @@ async def _render_admin_stats_menu(msg: Message) -> None:
 
 _STAT_PREVIEW_LIMIT = 5
 
+def _collect_client_info_map(inbounds: list) -> dict[str, dict]:
+    """Собирает email -> {limit_ip, enable, expiry_ms} одним проходом по inbounds."""
+    out: dict[str, dict] = {}
+    for ib in inbounds:
+        s_raw = ib.get("settings")
+        if not isinstance(s_raw, str):
+            continue
+        try:
+            for c in json.loads(s_raw).get("clients", []):
+                email = str(c.get("email") or "").strip()
+                if not email or email in out:
+                    continue
+                out[email] = {
+                    "limit_ip": int(c.get("limitIp") or 1),
+                    "enable": bool(c.get("enable", True)),
+                    "expiry_ms": int(c.get("expiryTime") or 0),
+                }
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _collect_traffic_map(inbounds: list) -> dict[str, tuple[int, int]]:
+    """Собирает email -> (up, down) по clientStats."""
+    out: dict[str, tuple[int, int]] = {}
+    for ib in inbounds:
+        for c in ib.get("clientStats") or []:
+            email = str(c.get("email") or "").strip()
+            if not email:
+                continue
+            out[email] = (int(c.get("up", 0) or 0), int(c.get("down", 0) or 0))
+    return out
+
+
+def _stats_admin_paged_kb(branch: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Навигация пагинированных страниц админской статистики."""
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="⬅️", callback_data=f"stats:admin:{branch}:page:{page - 1}"
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            InlineKeyboardButton(
+                text="➡️", callback_data=f"stats:admin:{branch}:page:{page + 1}"
+            )
+        )
+
+    inline_keyboard: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🔙 К статистике", callback_data="stats:admin:root")],
+    ]
+    if nav:
+        inline_keyboard.append(nav)
+    inline_keyboard.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
+    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
 
 async def _collect_unbound_panel_emails(settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI) -> list[str]:
     async with aiosqlite.connect(users_repo.db_path) as db:
@@ -191,6 +249,13 @@ async def stats_admin_branch(
     if len(parts) < 3:
         return await cb.answer("Ошибка данных", show_alert=True)
     mode = parts[2]
+    page = 0
+    # stats:admin:{users|panel}:page:{n}
+    if len(parts) >= 5 and parts[3] == "page":
+        try:
+            page = int(parts[4])
+        except ValueError:
+            page = 0
     await cb.answer()
     if mode == "root":
         return await edit_callback_nav(
@@ -215,13 +280,19 @@ async def stats_admin_branch(
                     cb, "📭 Нет пользователей с клиентом в панели.", _stats_admin_sub_kb()
                 )
             inbounds = await xui_api.get_inbounds()
+            traffic_map = _collect_traffic_map(inbounds)
+            client_info_map = _collect_client_info_map(inbounds)
             blocks: list[str] = []
-            for u in users[:_STAT_PREVIEW_LIMIT]:
+            total = len(users)
+            page_size = _STAT_PREVIEW_LIMIT
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(0, min(page, total_pages - 1))
+
+            current = users[page * page_size : (page + 1) * page_size]
+            for u in current:
                 email = u["xui_email"]
-                st = next((c for ib in inbounds for c in (ib.get("clientStats") or []) if c.get("email") == email), None)
-                up = st.get("up", 0) if st else 0
-                down = st.get("down", 0) if st else 0
-                info = await _get_client_info(xui_api, email)
+                up, down = traffic_map.get(email, (0, 0))
+                info = client_info_map.get(email) or {"limit_ip": 1, "enable": True, "expiry_ms": 0}
                 name = u["username"] or f"ID:{u['tg_id']}"
                 rid = u["tg_id"]
                 role = _role_label(rid, settings, {k: u[k] for k in u.keys()})
@@ -232,13 +303,10 @@ async def stats_admin_branch(
                         name, up, down, info, show_name=True, role_label=role, trial_approver=ap, vpn_issuer=vp
                     )
                 )
-            total = len(users)
-            head = f"📊 **Пользователи** (показано {min(_STAT_PREVIEW_LIMIT, total)} из {total}):\n\n"
-            tail = ""
-            if total > _STAT_PREVIEW_LIMIT:
-                tail = f"\n\n_…и ещё {total - _STAT_PREVIEW_LIMIT}. Полный список — «⚙️ Управление» → «👥 Пользователи»._"
-            text = head + "\n\n──────────────\n\n".join(blocks) + tail
-            return await edit_callback_nav(cb, text, _stats_admin_sub_kb(), parse_mode="Markdown")
+            head = f"📊 **Пользователи** (стр. {page + 1}/{total_pages}, всего {total}):\n\n"
+            text = head + "\n\n──────────────\n\n".join(blocks)
+            kb = _stats_admin_paged_kb("users", page, total_pages)
+            return await edit_callback_nav(cb, text, kb, parse_mode="Markdown")
         except Exception as e:
             LOGGER.exception("stats.admin.users.error")
             return await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
@@ -252,20 +320,23 @@ async def stats_admin_branch(
                     _stats_admin_sub_kb(),
                 )
             inbounds = await xui_api.get_inbounds()
+            traffic_map = _collect_traffic_map(inbounds)
+            client_info_map = _collect_client_info_map(inbounds)
             blocks: list[str] = []
-            for email in emails[:_STAT_PREVIEW_LIMIT]:
-                st = next((c for ib in inbounds for c in (ib.get("clientStats") or []) if c.get("email") == email), None)
-                up = st.get("up", 0) if st else 0
-                down = st.get("down", 0) if st else 0
-                info = await _get_client_info(xui_api, email)
-                blocks.append(_format_stat_block(email, up, down, info, show_name=True))
             total = len(emails)
-            head = f"📊 **Клиенты в панели** (показано {min(_STAT_PREVIEW_LIMIT, total)} из {total}):\n\n"
-            tail = ""
-            if total > _STAT_PREVIEW_LIMIT:
-                tail = f"\n\n_…и ещё {total - _STAT_PREVIEW_LIMIT}. Полный список — «⚙️ Управление» → «📥 Нет аккаунта ТГ»._"
-            text = head + "\n\n──────────────\n\n".join(blocks) + tail
-            return await edit_callback_nav(cb, text, _stats_admin_sub_kb(), parse_mode="Markdown")
+            page_size = _STAT_PREVIEW_LIMIT
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = max(0, min(page, total_pages - 1))
+
+            current = emails[page * page_size : (page + 1) * page_size]
+            for email in current:
+                up, down = traffic_map.get(email, (0, 0))
+                info = client_info_map.get(email) or {"limit_ip": 1, "enable": True, "expiry_ms": 0}
+                blocks.append(_format_stat_block(email, up, down, info, show_name=True))
+            head = f"📊 **Клиенты в панели** (стр. {page + 1}/{total_pages}, всего {total}):\n\n"
+            text = head + "\n\n──────────────\n\n".join(blocks)
+            kb = _stats_admin_paged_kb("panel", page, total_pages)
+            return await edit_callback_nav(cb, text, kb, parse_mode="Markdown")
         except Exception as e:
             LOGGER.exception("stats.admin.panel.error")
             return await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())

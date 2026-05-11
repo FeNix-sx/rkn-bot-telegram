@@ -114,3 +114,10 @@ class UsersRepository:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT tg_id FROM users WHERE is_admin=1") as cur:
                 return [r[0] async for r in cur]
+
+    async def delete_user(self, tg_id: int) -> bool:
+        """Удаляет строку пользователя (payments — CASCADE). Возвращает True, если была строка."""
+        async with get_connection(self.db_path) as c:
+            cur = await c.execute("DELETE FROM users WHERE tg_id=?", (tg_id,))
+            await c.commit()
+            return bool(cur.rowcount)

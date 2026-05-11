@@ -352,15 +352,16 @@ async def admin_main_cb(cb: CallbackQuery, settings: Settings, users_repo: Users
 
 
 @router.callback_query(F.data == "admin:panel_back")
-async def admin_panel_back(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def admin_panel_back(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    """Старые клавиатуры могли содержать «Назад» — удаляем сообщение, без лишнего «главного меню»."""
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
     await cb.answer()
-    uid = cb.from_user.id if cb.from_user else 0
-    await cb.message.answer(
-        "Главное меню:",
-        reply_markup=await user_reply_menu(uid, settings, users_repo, xui_api),
-    )
+    if cb.message:
+        try:
+            await cb.message.delete()
+        except Exception:
+            LOGGER.debug("admin.panel_back.delete_failed", exc_info=True)
 
 @router.callback_query((F.data == "admin:bound") | F.data.startswith("admin:bound:page:"))
 async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
@@ -472,11 +473,11 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
                     callback_data=f"bound:claim_steward:{tg_id}:{list_page}",
                 )
             ],
-            [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"bound:stub:delete:{tg_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"bound:del:ask:{tg_id}:{list_page}")],
             [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")],
         ]
     )
-    await _edit_admin_nav(cb, head + "\n\nНастройки (заглушки):", kb)
+    await _edit_admin_nav(cb, head + "\n\nДействия:", kb)
 
 
 @router.callback_query(F.data.startswith("bound:vpn_link:"))
@@ -968,22 +969,114 @@ async def bound_xui_toggle_flow(
     return await cb.answer("Неизвестное действие", show_alert=True)
 
 
-_STUB_LABELS = {
-    "delete": "Удалить полностью (БД + 3X-UI)",
-}
-
-@router.callback_query(F.data.startswith("bound:stub:"))
-async def bound_stub_echo(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+@router.callback_query(F.data.startswith("bound:del:ask:"))
+async def bound_delete_ask(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
-    seg = cb.data.split(":")
-    if len(seg) < 4:
-        await cb.answer()
-        return await _edit_admin_nav(cb, f"🔧 Заглушка (raw): {cb.data}", back_admin())
-    action, tg_s = seg[2], seg[3]
-    label = _STUB_LABELS.get(action, action)
+    parts = cb.data.split(":")
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    try:
+        tg_id, list_page = int(parts[3]), int(parts[4])
+    except ValueError:
+        return await cb.answer("Ошибка данных", show_alert=True)
     await cb.answer()
-    await _edit_admin_nav(cb, f"🔧 Заглушка: {label}\ntg_id: {tg_s}\nraw: {cb.data}", back_admin())
+    row = await users_repo.get_user(tg_id)
+    if not row:
+        return await _edit_admin_nav(cb, "❌ Пользователь не найден в БД.", back_admin())
+    email = (row.get("xui_email") or "").strip()
+    extra = f"\n📧 Клиент панели: `{email}`" if email else "\n📧 Клиент панели: *не привязан* — из 3X-UI ничего не удаляем."
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, удалить всё", callback_data=f"bound:del:yes:{tg_id}:{list_page}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"bound:user:{tg_id}:{list_page}"),
+            ],
+            [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")],
+        ]
+    )
+    await _edit_admin_nav(
+        cb,
+        f"⚠️ Безвозвратно удалить пользователя `{tg_id}` из БД бота"
+        f"{extra}\n\n"
+        "Оплаты по этому пользователю (таблица payments) удалятся каскадом.",
+        kb,
+    )
+
+
+@router.callback_query(F.data.startswith("bound:del:yes:"))
+async def bound_delete_confirm(
+    cb: CallbackQuery,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    try:
+        tg_id, list_page = int(parts[3]), int(parts[4])
+    except ValueError:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    if cb.from_user and tg_id == cb.from_user.id:
+        await cb.answer("Нельзя удалить самого себя", show_alert=True)
+        return await _edit_admin_nav(cb, "❌ Нельзя удалить свою собственную строку из БД.", _back_to_bound_user_kb(tg_id, list_page))
+    row = await users_repo.get_user(tg_id)
+    if not row:
+        await cb.answer("Уже удалён", show_alert=True)
+        return await _edit_admin_nav(
+            cb,
+            "❌ Пользователя уже нет в БД.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:bound:page:{list_page}")]
+                ]
+            ),
+        )
+    email = (row.get("xui_email") or "").strip()
+    panel_note = ""
+    await cb.answer("Удаляю…")
+    actor = _actor_label(cb.from_user)
+    if not os.getenv("MOCK_XUI") and email:
+        try:
+            iid = await xui_api.find_inbound_id_for_email(email)
+            await xui_api.delete_client_by_email(iid, email)
+        except XUIAPIError as e:
+            low = str(e).lower()
+            if "not found" in low or "empty" in low or "не найден" in low:
+                panel_note = f"\n⚠️ 3X-UI: {e}"
+            else:
+                LOGGER.exception("bound.del.xui")
+                return await _edit_admin_nav(cb, f"❌ 3X-UI: {e}", _back_to_bound_user_kb(tg_id, list_page))
+        except Exception as e:
+            LOGGER.exception("bound.del.xui")
+            return await _edit_admin_nav(cb, f"❌ 3X-UI: {e}", _back_to_bound_user_kb(tg_id, list_page))
+    try:
+        deleted = await users_repo.delete_user(tg_id)
+    except Exception as e:
+        LOGGER.exception("bound.del.db")
+        return await _edit_admin_nav(cb, f"❌ БД: {e}", back_admin())
+    if not deleted:
+        return await _edit_admin_nav(cb, "❌ Строка в БД не удалена (гонка?).", back_admin())
+    PENDING_NEW_USERS.pop(tg_id, None)
+    PENDING_TRIALS.pop(tg_id, None)
+    note = (
+        f"🗑 Пользователь `{tg_id}` удалён из БД бота."
+        + (f"\nКлиент панели `{email}` удалён из 3X-UI." if email and not os.getenv("MOCK_XUI") else "")
+        + (f"\nMOCK: панель не трогали; email было: `{email}`" if os.getenv("MOCK_XUI") and email else "")
+        + panel_note
+        + f"\nАдмин: {actor} ({cb.from_user.id if cb.from_user else '—'})"
+    )
+    await _broadcast_to_admins(bot, settings, users_repo, note)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")]
+        ]
+    )
+    await _edit_admin_nav(cb, "✅ Удалено. Уведомление отправлено всем админам." + panel_note, kb)
 
 
 @router.callback_query(F.data == "xui:add:panel")
@@ -1772,6 +1865,20 @@ async def bind_do_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRep
                 )
             await db.commit()
         await _edit_admin_nav(cb, f"✅ Привязано: `{tg_id}` ↔ `{email}`", back_admin())
+    except aiosqlite.OperationalError as e:
+        LOGGER.exception("bind.do_tg.error")
+        err = str(e).lower()
+        if "readonly" in err:
+            await _edit_admin_nav(
+                cb,
+                "❌ SQLite: БД только для чтения.\n"
+                "На VPS: каталог и файл из `DB_PATH` должны принадлежать пользователю сервиса, например:\n"
+                "`sudo chown -R rknbot:rknbot /opt/rkn-bot/data`\n"
+                "и перезапуск: `sudo systemctl restart rkn-bot`",
+                back_admin(),
+            )
+        else:
+            await _edit_admin_nav(cb, f"❌ SQLite: {e}", back_admin())
     except Exception as e:
         LOGGER.exception("bind.do_tg.error")
         await _edit_admin_nav(cb, f"❌ {type(e).__name__}", back_admin())
