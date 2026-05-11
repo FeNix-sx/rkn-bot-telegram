@@ -27,6 +27,7 @@ class Settings:
     xui_password: str
     xui_inbound_tag: str
     xui_inbound_id: int | None
+    xui_vless_host: str | None
     admin_ids: tuple[int, ...]
     trial_days: int
     db_path: str
@@ -74,6 +75,10 @@ def _xui_inbound_id() -> int | None:
     except ValueError:
         return None
 
+def _xui_vless_host() -> str | None:
+    v = os.getenv("XUI_VLESS_HOST", "").strip()
+    return v if v else None
+
 def _resolve_env_path(env_file: str | Path) -> Path:
     p = Path(env_file)
     return p if p.is_absolute() else _PROJECT_ROOT / p
@@ -97,6 +102,7 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         xui_password=_require_non_empty("XUI_PASSWORD"),
         xui_inbound_tag=_xui_inbound_tag(),
         xui_inbound_id=_xui_inbound_id(),
+        xui_vless_host=_xui_vless_host(),
         admin_ids=_parse_admin_ids(_require_non_empty("ADMIN_IDS")),
         trial_days=_parse_trial_days(_require_non_empty("TRIAL_DAYS")),
         db_path=_require_non_empty("DB_PATH"),

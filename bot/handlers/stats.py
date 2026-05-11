@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
-from bot.keyboards import reply_menu, back_admin
+from bot.keyboards import back_admin
+from bot.trial_visibility import user_reply_menu
 from core.xui_api import XUIAPI
 from core.config import Settings
 from db.repositories.users_repo import UsersRepository
@@ -106,7 +107,10 @@ async def stats_reply_button(msg: Message, settings: Settings, users_repo: Users
     if not tg: return
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
     if not is_adm:
-        await msg.answer("🚫 Нет доступа.", reply_markup=reply_menu(False))
+        await msg.answer(
+            "🚫 Нет доступа.",
+            reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api),
+        )
         return
     await _render_admin_stats(msg, settings, users_repo, xui_api)
 
@@ -115,11 +119,10 @@ async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, user
         row = await users_repo.get_user(tg_id)
         role = _role_label(tg_id, settings, row)
         if not row or not row.get("xui_email"):
-            is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
             return await msg.answer(
                 f"🔍 Профиль не привязан к панели.\n🔑 Полномочия: `{role}`",
                 parse_mode="Markdown",
-                reply_markup=reply_menu(is_adm),
+                reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row),
             )
 
         email = row["xui_email"]
@@ -134,12 +137,18 @@ async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, user
         text = _format_stat_block(
             None, up, down, info, show_name=False, role_label=role, trial_approver=ap, vpn_issuer=vp
         )
-        is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
-        await msg.answer(text, parse_mode="Markdown", reply_markup=reply_menu(is_adm))
+        await msg.answer(
+            text,
+            parse_mode="Markdown",
+            reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row),
+        )
     except Exception as e:
         LOGGER.exception("stats.personal.error")
-        is_adm = tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
-        await msg.answer(f"❌ Ошибка: {type(e).__name__}", reply_markup=reply_menu(is_adm))
+        row_e = await users_repo.get_user(tg_id)
+        await msg.answer(
+            f"❌ Ошибка: {type(e).__name__}",
+            reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row_e),
+        )
 
 async def _render_admin_stats(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     try:

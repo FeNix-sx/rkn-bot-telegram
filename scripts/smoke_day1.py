@@ -38,20 +38,16 @@ class FakeXUI:
         if limit_ip != 1:
             raise RuntimeError(f"unexpected limit_ip={limit_ip}")
 
-    async def build_or_get_subscription_url(
-        self,
-        *,
-        inbound_id: int | None = None,
-        email: str | None = None,
-        existing_url: str | None = None,
-        sub_id: str | None = None,
-    ) -> str:
-        del inbound_id, sub_id
-        if existing_url and existing_url.strip():
-            return existing_url.strip()
+    async def build_vless_share_uri(self, *, email: str, public_host: str | None = None) -> str:
+        del public_host
         if not email:
             raise RuntimeError("email is required")
-        return f"https://fake-xui.local/sub/{email}"
+        return (
+            f"vless://00000000-0000-4000-8000-{email[-12:]:0>12}"
+            "@89.125.85.47:443?type=tcp&encryption=none&security=reality"
+            "&pbk=FAKE_PBK&fp=chrome&sni=www.nvidia.com&sid=abcd1234&spx=%2F"
+            "&flow=xtls-rprx-vision#smoke"
+        )
 
 
 async def run_smoke() -> dict[str, object]:
@@ -91,9 +87,9 @@ async def run_smoke() -> dict[str, object]:
                 client_uuid=xui_uuid,
                 limit_ip=1,
             )
-            subscription_url = await xui_api.build_or_get_subscription_url(
-                inbound_id=inbound_id,
+            subscription_url = await xui_api.build_vless_share_uri(
                 email=xui_email,
+                public_host="89.125.85.47",
             )
             await users_repo.set_trial(
                 tg_id=tg_id,

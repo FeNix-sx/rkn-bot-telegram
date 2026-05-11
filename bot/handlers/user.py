@@ -9,10 +9,11 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
 
 from core.config import Settings
-from core.xui_api import XUIAPI
+from core.xui_api import XUIAPI, XUIAPIError
 from db.repositories.users_repo import UsersRepository
 from bot.keyboards import reply_menu
 from bot.handlers.stats import show_personal_stats
+from bot.trial_visibility import should_show_trial_button, user_reply_menu
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
@@ -49,7 +50,7 @@ async def _issue_trial_now(
     email = f"trial_{tg_id}"
     uuid_val = str(uuid4())
     if os.getenv("MOCK_XUI"):
-        url = f"mock://sub/{email}"
+        url = f"vless://{uuid_val}@127.0.0.1:443?type=tcp&encryption=none&security=none#mock_{tg_id}"
         await users_repo.set_trial(
             tg_id,
             start.isoformat(timespec="seconds"),
@@ -65,7 +66,10 @@ async def _issue_trial_now(
         tag=settings.xui_inbound_tag,
     )
     await xui_api.add_client(inbound_id, email, uuid_val, limit_ip=1)
-    url = await xui_api.build_or_get_subscription_url(inbound_id=inbound_id, email=email)
+    url = await xui_api.build_vless_share_uri(
+        email=email,
+        public_host=settings.xui_vless_host,
+    )
     await users_repo.set_trial(
         tg_id,
         start.isoformat(timespec="seconds"),
@@ -78,7 +82,7 @@ async def _issue_trial_now(
     return url
 
 @router.message(Command("start"))
-async def start(msg: Message, settings: Settings, users_repo: UsersRepository, bot: Bot):
+async def start(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI, bot: Bot):
     tg = msg.from_user
     if not tg: return
     row = await users_repo.get_user(tg.id)
@@ -87,17 +91,21 @@ async def start(msg: Message, settings: Settings, users_repo: UsersRepository, b
     if tg.id in settings.admin_ids:
         created = await users_repo.create_user_if_not_exists(tg.id, tg.username, tg.first_name, tg.last_name)
         text = "Привет! Профиль создан." if created else "Бот активирован"
-        await msg.answer(text, reply_markup=reply_menu(True))
+        row2 = await users_repo.get_user(tg.id)
+        await msg.answer(text, reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row2))
         return
 
     if row:
-        await msg.answer("Бот активирован", reply_markup=reply_menu(is_adm))
+        await msg.answer(
+            "Бот активирован",
+            reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row),
+        )
         return
 
     if tg.id in PENDING_NEW_USERS:
         await msg.answer(
             "⏳ Запрос уже отправлен. Дождись подтверждения администратора.",
-            reply_markup=reply_menu(False),
+            reply_markup=reply_menu(False, show_trial=False),
         )
         return
 
@@ -128,7 +136,7 @@ async def start(msg: Message, settings: Settings, users_repo: UsersRepository, b
             pass
     await msg.answer(
         "⏳ Запрос отправлен администратору. Дождись подтверждения доступа.",
-        reply_markup=reply_menu(False),
+        reply_markup=reply_menu(False, show_trial=False),
     )
 
 @router.message(Command("status"))
@@ -140,7 +148,7 @@ async def status(msg: Message, settings: Settings, users_repo: UsersRepository, 
 
 @router.message(Command("link"))
 @router.message(F.text == "🔗 Моя ссылка")
-async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
+async def link(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     tg = msg.from_user
     if not tg: return
     row = await users_repo.get_user(tg.id)
@@ -148,16 +156,35 @@ async def link(msg: Message, settings: Settings, users_repo: UsersRepository):
         if tg.id in PENDING_NEW_USERS:
             return await msg.answer(
                 "⏳ Сначала дождись подтверждения регистрации (/start).",
-                reply_markup=reply_menu(False),
+                reply_markup=reply_menu(False, show_trial=False),
             )
         return await msg.answer(
             "Сначала /start и подтверждение администратора.",
-            reply_markup=reply_menu(False),
+            reply_markup=reply_menu(False, show_trial=False),
         )
-    url = (row.get("subscription_url") or "").strip()
-    if not url: return await msg.answer("Нет ссылки. Запусти /trial.", reply_markup=reply_menu())
-    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
-    await msg.answer(f"Твоя ссылка: {url}", reply_markup=reply_menu(is_adm))
+    email = (row.get("xui_email") or "").strip()
+    if not email:
+        return await msg.answer(
+            "Нет привязки к клиенту в панели (xui_email). Сначала триал / выдача админом.",
+            reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row),
+        )
+    kb = await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row)
+    if os.getenv("MOCK_XUI"):
+        uid = (row.get("xui_uuid") or "00000000-0000-0000-0000-000000000001").strip()
+        vless = f"vless://{uid}@127.0.0.1:443?type=tcp&encryption=none&security=none#mock"
+    else:
+        try:
+            vless = await xui_api.build_vless_share_uri(
+                email=email,
+                public_host=settings.xui_vless_host,
+            )
+        except XUIAPIError as e:
+            return await msg.answer(
+                f"Не удалось собрать vless-ссылку из панели: {e}",
+                reply_markup=kb,
+            )
+    await msg.answer("Ваша ссылка для подключения:")
+    await msg.answer(vless, reply_markup=kb)
 
 @router.message(Command("trial"))
 @router.message(F.text == "🚀 Получить триал")
@@ -169,16 +196,27 @@ async def cmd_trial(msg: Message, settings: Settings, users_repo: UsersRepositor
         if tg.id in PENDING_NEW_USERS:
             return await msg.answer(
                 "⏳ Сначала дождись подтверждения регистрации (/start).",
-                reply_markup=reply_menu(False),
+                reply_markup=reply_menu(False, show_trial=False),
             )
         return await msg.answer(
             "Сначала нажми /start и дождись подтверждения администратора.",
-            reply_markup=reply_menu(False),
+            reply_markup=reply_menu(False, show_trial=False),
         )
-    active, end_date = _is_sub_active(row)
-    if active:
-        await msg.answer(f"🚫 Подписка уже активирована.\n📅 Истекает: `{_fmt(end_date)}`", parse_mode="Markdown", reply_markup=reply_menu())
-        return
+    if not await should_show_trial_button(row, xui_api):
+        if int(row.get("has_trial_used") or 0):
+            reason = "Триал уже был использован."
+        else:
+            active, end_date = _is_sub_active(row)
+            reason = (
+                f"Подписка уже активна до `{_fmt(end_date)}`."
+                if active
+                else "Сейчас триал недоступен (есть активная подписка в панели)."
+            )
+        return await msg.answer(
+            f"🚫 {reason}",
+            parse_mode="Markdown",
+            reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row),
+        )
     PENDING_TRIALS[tg.id] = {"username": tg.username, "first_name": tg.first_name}
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Разрешить", callback_data=f"trial:approve:{tg.id}")],
@@ -191,4 +229,7 @@ async def cmd_trial(msg: Message, settings: Settings, users_repo: UsersRepositor
     for aid in admins:
         try: await bot.send_message(aid, text, reply_markup=kb)
         except: pass
-    await msg.answer("⏳ Запрос отправлен администраторам. Ожидайте решения.")
+    await msg.answer(
+        "⏳ Запрос отправлен администраторам. Ожидайте решения.",
+        reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row),
+    )

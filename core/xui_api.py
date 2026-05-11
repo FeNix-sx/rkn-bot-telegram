@@ -7,7 +7,8 @@ import secrets
 import string
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import quote, urlparse
+import ipaddress
+from urllib.parse import quote, urlencode, urlparse
 import httpx
 
 LOGGER = logging.getLogger(__name__)
@@ -328,16 +329,117 @@ class XUIAPI:
                 return settings or {}
         raise XUIAPIError(f"Inbound {inbound_id} not found.")
 
-    async def build_or_get_subscription_url(self, *, inbound_id: int, email: str) -> str:
-        settings = await self._get_inbound_settings(inbound_id)
-        clients = settings.get("clients", [])
-        target = (email or "").strip()
-        sub_id = None
-        for c in clients:
-            if str(c.get("email") or "").strip() == target:
-                sub_id = str(c.get("subId") or "").strip()
-                break
-        if not sub_id:
-            raise XUIAPIError("subId not found (клиент без subId в настройках inbound).")
+    def _public_host_for_inbound(self, listen: str, public_host: str | None) -> str:
         parsed = urlparse(self._base_url)
-        return f"{parsed.scheme}://{parsed.netloc}/sub/{sub_id}"
+        fallback = (public_host or "").strip() or (parsed.hostname or "").strip()
+        if not fallback:
+            raise XUIAPIError(
+                "Не задан адрес для vless://: задай XUI_VLESS_HOST или XUI_API_URL с реальным hostname (не пустым)."
+            )
+        l = (listen or "").strip()
+        if not l or l.startswith("@") or l in ("0.0.0.0", "::", "127.0.0.1"):
+            host = fallback
+        else:
+            host = l
+        try:
+            ip = ipaddress.ip_address(host)
+            if isinstance(ip, ipaddress.IPv6Address) and not host.startswith("["):
+                return f"[{host}]"
+        except ValueError:
+            pass
+        return host
+
+    async def build_vless_share_uri(self, *, email: str, public_host: str | None = None) -> str:
+        """Текстовая ссылка vless:// как «Копировать» в 3X-UI (VLESS + TCP + Reality)."""
+        target = (email or "").strip()
+        if not target:
+            raise XUIAPIError("Empty client email.")
+        inbound_id = await self.find_inbound_id_for_email(target)
+        inbound: dict[str, Any] | None = None
+        for ib in await self.get_inbounds():
+            if ib.get("id") == inbound_id:
+                inbound = ib
+                break
+        if not inbound:
+            raise XUIAPIError("Inbound не найден.")
+        proto = str(inbound.get("protocol") or "").strip().lower()
+        if proto != "vless":
+            raise XUIAPIError(f"vless:// поддерживается только для protocol=vless, сейчас: {proto!r}.")
+        port = int(inbound.get("port") or 0)
+        if not port:
+            raise XUIAPIError("У inbound port=0.")
+
+        listen = str(inbound.get("listen") or "").strip()
+        host = self._public_host_for_inbound(listen, public_host)
+
+        s_raw = inbound.get("settings")
+        if isinstance(s_raw, str):
+            s_json: dict[str, Any] = json.loads(s_raw)
+        else:
+            s_json = dict(s_raw or {})
+        clients = s_json.get("clients") or []
+        client = next((c for c in clients if str(c.get("email") or "").strip() == target), None)
+        if not client:
+            raise XUIAPIError(f"Клиент {target!r} не найден в inbound.")
+        uuid_val = str(client.get("id") or "").strip()
+        if not uuid_val:
+            raise XUIAPIError("У клиента пустой id (UUID).")
+        flow = str(client.get("flow") or "").strip()
+        enc = str(s_json.get("decryption") or s_json.get("encryption") or "none").strip() or "none"
+
+        st_raw = inbound.get("streamSettings")
+        if isinstance(st_raw, str):
+            stream: dict[str, Any] = json.loads(st_raw)
+        else:
+            stream = dict(st_raw or {})
+        network = str(stream.get("network") or "tcp").strip()
+        security = str(stream.get("security") or "none").strip()
+
+        params: list[tuple[str, str]] = [
+            ("type", network),
+            ("encryption", enc),
+        ]
+        if security == "reality":
+            rs = stream.get("realitySettings") or {}
+            if isinstance(rs, str):
+                rs = json.loads(rs)
+            nset = rs.get("settings") or {}
+            if isinstance(nset, str):
+                nset = json.loads(nset)
+            pbk = str(nset.get("publicKey") or "").strip()
+            fp = str(nset.get("fingerprint") or "chrome").strip()
+            spx_raw = nset.get("spiderX", "/")
+            spx = quote(str(spx_raw), safe="")
+            sni = ""
+            server_names = rs.get("serverNames") or []
+            if isinstance(server_names, list) and server_names:
+                sni = str(server_names[0])
+            if not sni:
+                dest = str(rs.get("dest") or "")
+                if ":" in dest:
+                    sni = dest.rsplit(":", 1)[0]
+                else:
+                    sni = dest
+            short_ids = rs.get("shortIds") or []
+            sid = str(short_ids[0]) if isinstance(short_ids, list) and short_ids else ""
+            params.extend(
+                [
+                    ("security", "reality"),
+                    ("pbk", pbk),
+                    ("fp", fp),
+                    ("sni", sni),
+                    ("sid", sid),
+                    ("spx", spx),
+                ]
+            )
+            if not pbk:
+                raise XUIAPIError("Reality: пустой publicKey (pbk) — проверь inbound в панели.")
+        else:
+            params.append(("security", security))
+
+        if flow:
+            params.append(("flow", flow))
+
+        query = urlencode(params, quote_via=quote)
+        frag = quote(target, safe="")
+        return f"vless://{uuid_val}@{host}:{port}?{query}#{frag}"

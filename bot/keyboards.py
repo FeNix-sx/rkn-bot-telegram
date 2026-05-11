@@ -1,8 +1,11 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 
-def reply_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def reply_menu(is_admin: bool = False, *, show_trial: bool = True) -> ReplyKeyboardMarkup:
+    top = [KeyboardButton(text="📊 Мой статус")]
+    if show_trial:
+        top.insert(0, KeyboardButton(text="🚀 Получить триал"))
     kb = [
-        [KeyboardButton(text="🚀 Получить триал"), KeyboardButton(text="📊 Мой статус")],
+        top,
         [KeyboardButton(text="🔗 Моя ссылка")],
     ]
     if is_admin:
@@ -12,9 +15,9 @@ def reply_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
 
 def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Привязанные", callback_data="admin:bound")],
-        [InlineKeyboardButton(text="🔗 Нет аккаунта ТГ", callback_data="admin:unbound")],
-        [InlineKeyboardButton(text="❓ Нет клиента VPN", callback_data="admin:unknown")],
+        [InlineKeyboardButton(text="👥Привязанные", callback_data="admin:bound")],
+        [InlineKeyboardButton(text="📥Нет аккаунта ТГ", callback_data="admin:unbound")],
+        [InlineKeyboardButton(text="🔌Нет клиента VPN", callback_data="admin:unknown")],
         [InlineKeyboardButton(text="➕ Добавить клиент", callback_data="xui:add:panel")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin:panel_back")],
     ])
