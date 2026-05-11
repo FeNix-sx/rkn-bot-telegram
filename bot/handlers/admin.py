@@ -418,7 +418,7 @@ async def admin_bound(cb: CallbackQuery, settings: Settings, users_repo: UsersRe
             kb.append(nav)
         kb.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
         await cb.message.answer(
-            f"👥 Привязанные (стр. {page + 1}/{total_pages}):\n\n"
+            f"👥 Пользователи (стр. {page + 1}/{total_pages}):\n\n"
             "Пользователи с Telegram, у которых в боте указан клиент 3X-UI (полная связка ТГ ↔ VPN).",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
         )
@@ -466,7 +466,7 @@ async def bound_user_menu(cb: CallbackQuery, settings: Settings, users_repo: Use
                 )
             ],
             [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"bound:stub:delete:{tg_id}")],
-            [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")],
+            [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")],
         ]
     )
     await cb.message.answer(head + "\n\nНастройки (заглушки):", reply_markup=kb)
@@ -526,7 +526,7 @@ async def bound_claim_steward(cb: CallbackQuery, settings: Settings, users_repo:
         filled.append("VPN")
     await cb.message.answer(
         f"👤 {tg_id}: записал тебя в: {', '.join(filled)}.\n"
-        f"Открой карточку снова из списка привязанных (стр. {list_page + 1}), чтобы увидеть строки.",
+        f"Открой карточку снова из списка пользователей (стр. {list_page + 1}), чтобы увидеть строки.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 К карточке", callback_data=f"bound:user:{tg_id}:{list_page}")],
@@ -621,7 +621,7 @@ async def bound_renew_flow(
             "Продление отменено.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")]
+                    [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")]
                 ]
             ),
         )
@@ -665,7 +665,7 @@ async def bound_renew_flow(
             txt,
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")]
+                    [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")]
                 ]
             ),
         )
@@ -710,7 +710,7 @@ async def bound_renew_manual_date(
         txt,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 К списку привязанных", callback_data=f"admin:bound:page:{list_page}")]
+                [InlineKeyboardButton(text="🔙 К списку пользователей", callback_data=f"admin:bound:page:{list_page}")]
             ]
         ),
     )
@@ -1354,7 +1354,7 @@ async def unbound_iplimit_flow(
         await cb.answer()
         if await _xui_email_bound_in_db(users_repo, email):
             return await cb.message.answer(
-                f"❌ `{email}` уже привязан в БД — открой карточку из «Привязанные».",
+                f"❌ `{email}` уже привязан в БД — открой карточку из «Пользователи».",
                 reply_markup=back_admin(),
             )
         nums = [
@@ -1435,7 +1435,7 @@ async def unbound_renew_flow(
     list_page, email = parsed
     if await _xui_email_bound_in_db(users_repo, email):
         await cb.answer("Уже в БД", show_alert=True)
-        return await cb.message.answer(f"❌ `{email}` привязан — карточка в «Привязанные».", reply_markup=back_admin())
+        return await cb.message.answer(f"❌ `{email}` привязан — карточка в «Пользователи».", reply_markup=back_admin())
     if kind == "start":
         await state.set_state(AdminRenew.waiting_manual_date)
         await state.update_data(target_email=email, list_page=list_page, target_tg_id=None)
@@ -1535,7 +1535,7 @@ async def unbound_xui_toggle_flow(
         await cb.answer()
         if await _xui_email_bound_in_db(users_repo, email):
             return await cb.message.answer(
-                f"❌ `{email}` уже в БД — управляй из «Привязанные».",
+                f"❌ `{email}` уже в БД — управляй из «Пользователи».",
                 reply_markup=back_admin(),
             )
         cur = await _fetch_enabled(email)
