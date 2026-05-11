@@ -8,7 +8,7 @@ import string
 from collections.abc import Mapping
 from typing import Any
 import ipaddress
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 import httpx
 
 LOGGER = logging.getLogger(__name__)
@@ -408,8 +408,17 @@ class XUIAPI:
                 nset = json.loads(nset)
             pbk = str(nset.get("publicKey") or "").strip()
             fp = str(nset.get("fingerprint") or "chrome").strip()
+            # spiderX в JSON панели иногда уже в виде %2F; нельзя quote() до urlencode —
+            # иначе двойное кодирование: spx=%252F (клиент ждёт spx=%2F для «/»).
             spx_raw = nset.get("spiderX", "/")
-            spx = quote(str(spx_raw), safe="")
+            spx_val = str(spx_raw if spx_raw is not None else "/")
+            for _ in range(5):
+                u = unquote(spx_val)
+                if u == spx_val:
+                    break
+                spx_val = u
+            if not spx_val:
+                spx_val = "/"
             sni = ""
             server_names = rs.get("serverNames") or []
             if isinstance(server_names, list) and server_names:
@@ -429,7 +438,7 @@ class XUIAPI:
                     ("fp", fp),
                     ("sni", sni),
                     ("sid", sid),
-                    ("spx", spx),
+                    ("spx", spx_val),
                 ]
             )
             if not pbk:

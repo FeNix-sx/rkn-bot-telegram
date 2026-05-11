@@ -19,7 +19,7 @@ from core.config import Settings
 from db.repositories.users_repo import UsersRepository
 from db.database import utc_now_iso
 from bot.handlers.user import PENDING_TRIALS, PENDING_NEW_USERS, _issue_trial_now
-from bot.handlers.stats import _admin_display
+from bot.handlers.stats import _admin_display, _get_client_info, _gb
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
@@ -94,6 +94,12 @@ async def _xui_create_client_and_url(
     )
 
 
+def _expiry_dt_from_panel_ms(expiry_ms: int) -> datetime | None:
+    if not expiry_ms or expiry_ms > 9999999999999:
+        return None
+    return datetime.fromtimestamp(expiry_ms / 1000, tz=timezone.utc)
+
+
 def _sub_end_datetime(row: dict) -> datetime | None:
     raw = row.get("paid_until") or row.get("trial_end")
     if not raw:
@@ -162,6 +168,58 @@ async def _apply_subscription_end(
             LOGGER.warning("renew.xui.warn: %s", e)
             xui_note = f"\n⚠️ БД обновлена; 3X-UI: {e}"
     return f"✅ Срок подписки до: {end_iso} UTC{xui_note}"
+
+
+async def _apply_subscription_end_by_email(
+    email: str,
+    new_end: datetime,
+    xui_api: XUIAPI,
+) -> str:
+    new_end = new_end.astimezone(timezone.utc)
+    end_iso = new_end.isoformat(timespec="seconds")
+    if os.getenv("MOCK_XUI"):
+        return f"✅ MOCK: срок в панели до: {end_iso} UTC"
+    xui_note = ""
+    try:
+        iid = await xui_api.find_inbound_id_for_email(email)
+        ms = int(new_end.timestamp() * 1000)
+        await xui_api.set_client_expiry(iid, email, ms)
+    except Exception as e:
+        LOGGER.warning("renew.unbound.xui.warn: %s", e)
+        xui_note = f"\n⚠️ 3X-UI: {e}"
+    return f"✅ Срок в панели до: {end_iso} UTC{xui_note}"
+
+
+def _unbound_page_email(data: str, prefix_segments: int) -> tuple[int, str] | None:
+    """Разбор callback вида prefix…:page:email (email без «:» внутри)."""
+    parts = data.split(":", prefix_segments + 1)
+    if len(parts) < prefix_segments + 2:
+        return None
+    try:
+        return int(parts[prefix_segments]), parts[prefix_segments + 1]
+    except ValueError:
+        return None
+
+
+def _traffic_up_down_for_email(inbounds: list, email: str) -> tuple[int, int]:
+    for ib in inbounds:
+        for c in ib.get("clientStats") or []:
+            if c.get("email") == email:
+                return int(c.get("up", 0) or 0), int(c.get("down", 0) or 0)
+    return 0, 0
+
+
+def _back_to_unbound_panel_kb(email: str, list_page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔙 К карточке клиента",
+                    callback_data=f"unbound:panel:menu:{list_page}:{email}",
+                )
+            ]
+        ]
+    )
 
 
 async def _is_admin(tg_id: int, settings: Settings, users_repo: UsersRepository) -> bool:
@@ -572,7 +630,7 @@ async def bound_renew_flow(
     tg_id, list_page = int(parts[3]), int(parts[4])
     if kind == "start":
         await state.set_state(AdminRenew.waiting_manual_date)
-        await state.update_data(target_tg_id=tg_id, list_page=list_page)
+        await state.update_data(target_tg_id=tg_id, list_page=list_page, target_email=None)
         await cb.answer()
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -626,12 +684,23 @@ async def bound_renew_manual_date(
         await state.clear()
         return
     data = await state.get_data()
-    tg_id = int(data.get("target_tg_id", 0))
     list_page = int(data.get("list_page", 0))
     parsed = _parse_ddmmyyyy(msg.text)
     if not parsed:
         return await msg.answer("❌ Неверный формат. Нужно ДД.ММ.ГГГГ, например 09.06.2026")
+    target_email = (data.get("target_email") or "").strip()
     await state.clear()
+    if target_email:
+        try:
+            txt = await _apply_subscription_end_by_email(target_email, parsed, xui_api)
+        except Exception as e:
+            LOGGER.exception("renew.manual.unbound.error")
+            txt = f"❌ {e}"
+        return await msg.answer(
+            txt,
+            reply_markup=_back_to_unbound_panel_kb(target_email, list_page),
+        )
+    tg_id = int(data.get("target_tg_id", 0))
     try:
         txt = await _apply_subscription_end(tg_id, parsed, users_repo, xui_api)
     except Exception as e:
@@ -1153,7 +1222,7 @@ async def admin_unbound(cb: CallbackQuery, settings: Settings, users_repo: Users
             [
                 InlineKeyboardButton(
                     text=f"📥 {row['email']} | ↑{row['up'] // 1024**2}МБ",
-                    callback_data=f"unbound:panel:menu:{row['email']}",
+                    callback_data=f"unbound:panel:menu:{page}:{row['email']}",
                 )
             ]
             for row in current
@@ -1174,36 +1243,83 @@ async def admin_unbound(cb: CallbackQuery, settings: Settings, users_repo: Users
 
 
 @router.callback_query(F.data.startswith("unbound:panel:menu:"))
-async def unbound_panel_client_menu(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+async def unbound_panel_client_menu(
+    cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI
+):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
-    parts = cb.data.split(":", 3)
-    if len(parts) < 4:
+    parsed = _unbound_page_email(cb.data, 3)
+    if not parsed:
         return await cb.answer("Ошибка данных", show_alert=True)
-    email = parts[3]
+    list_page, email = parsed
     await cb.answer()
+    try:
+        inbounds = await xui_api.get_inbounds()
+    except Exception as e:
+        LOGGER.exception("unbound.panel.inbounds")
+        return await cb.message.answer(f"❌ {e}", reply_markup=back_admin())
+    up, down = _traffic_up_down_for_email(inbounds, email)
+    info = await _get_client_info(xui_api, email)
+    exp_ms = int(info.get("expiry_ms") or 0)
+    if exp_ms > 0 and exp_ms < 9999999999999:
+        exp_dt = datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc)
+        sub_line = f"📅 подписка до: `{exp_dt.strftime('%d.%m.%Y')}`"
+    else:
+        sub_line = "📅 подписка до: `бессрочно`"
+    head = (
+        f"📥 Клиент панели (без аккаунта ТГ в боте)\n"
+        f"👤 `{email}`\n"
+        f"✅ Одобрил: —\n"
+        f"🔗 VPN: —\n"
+        f"📊 трафик: ↑{_gb(up)} ↓{_gb(down)} | {_gb(up + down)} общий\n"
+        f"🔗 подключений: `{info['limit_ip']}`\n"
+        f"📡 статус: {'✅ вкл' if info['enable'] else '❌ откл'}\n"
+        f"{sub_line}"
+    )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Ссылка на VPN", callback_data=f"unbound:vpn_link:{email}")],
-            [InlineKeyboardButton(text="🔗 Привязать к Telegram", callback_data=f"bind:client:{email}")],
-            [InlineKeyboardButton(text="🗑 Удалить из 3X-UI", callback_data=f"unbound:del:ask:{email}")],
-            [InlineKeyboardButton(text="🔙 К списку", callback_data="admin:unbound:page:0")],
+            [InlineKeyboardButton(text="📅 Продлить подписку", callback_data=f"unbound:renew:start:{list_page}:{email}")],
+            [
+                InlineKeyboardButton(
+                    text="📶 Количество подключений (IP limit)",
+                    callback_data=f"unbound:iplimit:menu:{list_page}:{email}",
+                )
+            ],
+            [
+                InlineKeyboardButton(text="👑 Сделать админом", callback_data=f"unbound:stub:grant:{list_page}:{email}"),
+                InlineKeyboardButton(text="🚫 Убрать админа", callback_data=f"unbound:stub:revoke:{list_page}:{email}"),
+            ],
+            [InlineKeyboardButton(text="🔗 Ссылка на VPN", callback_data=f"unbound:vpn_link:{list_page}:{email}")],
+            [
+                InlineKeyboardButton(
+                    text="⏸ Отключить", callback_data=f"unbound:xui_toggle:ask:disable:{list_page}:{email}"
+                ),
+                InlineKeyboardButton(
+                    text="▶️ Включить", callback_data=f"unbound:xui_toggle:ask:enable:{list_page}:{email}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Я ответственный админ",
+                    callback_data=f"unbound:stub:steward:{list_page}:{email}",
+                )
+            ],
+            [InlineKeyboardButton(text="🗑 Удалить полностью", callback_data=f"unbound:del:ask:{list_page}:{email}")],
+            [InlineKeyboardButton(text="🔗 Привязать к Telegram", callback_data=f"bind:client:{list_page}:{email}")],
+            [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:unbound:page:{list_page}")],
         ]
     )
-    await cb.message.answer(
-        f"📥 Клиент панели (без аккаунта ТГ в боте):\n`{email}`\n\nВыбери действие:",
-        reply_markup=kb,
-    )
+    await cb.message.answer(head + "\n\nНастройки (заглушки):", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("unbound:vpn_link:"))
 async def unbound_vpn_link(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
-    parts = cb.data.split(":", 2)
-    if len(parts) < 3:
+    parsed = _unbound_page_email(cb.data, 2)
+    if not parsed:
         return await cb.answer("Ошибка данных", show_alert=True)
-    email = parts[2]
+    list_page, email = parsed
     await cb.answer()
     try:
         await _send_vpn_link_to_admin(
@@ -1217,22 +1333,280 @@ async def unbound_vpn_link(cb: CallbackQuery, settings: Settings, users_repo: Us
         await cb.message.answer(f"❌ Не удалось получить ссылку: {e}")
 
 
+@router.callback_query(F.data.startswith("unbound:iplimit:"))
+async def unbound_iplimit_flow(
+    cb: CallbackQuery,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    kind = parts[2]
+    if kind == "menu":
+        parsed = _unbound_page_email(cb.data, 3)
+        if not parsed:
+            return await cb.answer("Ошибка данных", show_alert=True)
+        list_page, email = parsed
+        await cb.answer()
+        if await _xui_email_bound_in_db(users_repo, email):
+            return await cb.message.answer(
+                f"❌ `{email}` уже привязан в БД — открой карточку из «Привязанные».",
+                reply_markup=back_admin(),
+            )
+        nums = [
+            InlineKeyboardButton(text=str(n), callback_data=f"unbound:iplimit:set:{list_page}:{email}:{n}")
+            for n in (1, 2, 3, 4, 5)
+        ]
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                nums,
+                [
+                    InlineKeyboardButton(
+                        text="🔙 К карточке клиента",
+                        callback_data=f"unbound:panel:menu:{list_page}:{email}",
+                    )
+                ],
+            ]
+        )
+        return await cb.message.answer("Лимит одновременных подключений (IP limit), значение 1–5:", reply_markup=kb)
+    if kind == "set":
+        if len(parts) < 6:
+            return await cb.answer("Ошибка данных", show_alert=True)
+        try:
+            list_page, email, lim_s = int(parts[3]), parts[4], parts[5]
+        except ValueError:
+            return await cb.answer("Ошибка данных", show_alert=True)
+        lim = int(lim_s)
+        if lim not in (1, 2, 3, 4, 5):
+            return await cb.answer("Только 1–5", show_alert=True)
+        await cb.answer()
+        if await _xui_email_bound_in_db(users_repo, email):
+            return await cb.message.answer(
+                f"❌ `{email}` уже привязан в БД.",
+                reply_markup=back_admin(),
+            )
+        try:
+            if os.getenv("MOCK_XUI"):
+                txt = f"✅ MOCK: limitIp={lim} для {email}"
+            else:
+                iid = await xui_api.find_inbound_id_for_email(email)
+                await xui_api.set_client_limit_ip(iid, email, lim)
+                txt = f"✅ Лимит IP для {email}: {lim}"
+        except Exception as e:
+            LOGGER.exception("unbound.iplimit.set.error")
+            txt = f"❌ {e}"
+        return await cb.message.answer(txt, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("unbound:renew:"))
+async def unbound_renew_flow(
+    cb: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":")
+    if len(parts) < 4:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    kind = parts[2]
+    if kind == "cancel":
+        list_page = int(parts[3]) if len(parts) > 3 else 0
+        await state.clear()
+        await cb.answer("Отменено")
+        return await cb.message.answer(
+            "Продление отменено.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:unbound:page:{list_page}")]
+                ]
+            ),
+        )
+    parsed = _unbound_page_email(cb.data, 3)
+    if not parsed:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    list_page, email = parsed
+    if await _xui_email_bound_in_db(users_repo, email):
+        await cb.answer("Уже в БД", show_alert=True)
+        return await cb.message.answer(f"❌ `{email}` привязан — карточка в «Привязанные».", reply_markup=back_admin())
+    if kind == "start":
+        await state.set_state(AdminRenew.waiting_manual_date)
+        await state.update_data(target_email=email, list_page=list_page, target_tg_id=None)
+        await cb.answer()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📆 На 1 месяц", callback_data=f"unbound:renew:1m:{list_page}:{email}")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"unbound:renew:cancel:{list_page}")],
+            ]
+        )
+        return await cb.message.answer(
+            f"Продление подписки в панели для `{email}` (строка в БД бота не меняется).\n\n"
+            "Отправь дату окончания: ДД.ММ.ГГГГ (до 23:59:59 UTC этого дня), "
+            "или нажми «На 1 месяц».",
+            reply_markup=kb,
+        )
+    if kind == "1m":
+        await state.clear()
+        await cb.answer()
+        now = datetime.now(timezone.utc)
+        info = await _get_client_info(xui_api, email)
+        end_dt = _expiry_dt_from_panel_ms(int(info.get("expiry_ms") or 0))
+        if end_dt and end_dt > now:
+            new_end = _add_one_calendar_month(end_dt)
+        else:
+            new_end = _eod_plus_one_month_from_today_utc()
+        try:
+            txt = await _apply_subscription_end_by_email(email, new_end, xui_api)
+        except Exception as e:
+            LOGGER.exception("unbound.renew.1m.error")
+            txt = f"❌ {e}"
+        return await cb.message.answer(txt, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("unbound:stub:"))
+async def unbound_stub_no_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":", 4)
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    kind, list_page_s, email = parts[2], parts[3], parts[4]
+    try:
+        list_page = int(list_page_s)
+    except ValueError:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    await cb.answer()
+    if kind == "grant":
+        msg = "ℹ️ Права администратора в боте выдаются пользователю Telegram. Сначала привяжи этого клиента к TG."
+    elif kind == "revoke":
+        msg = "ℹ️ Снять админа можно только у пользователя в боте. Сначала привяжи клиента к TG."
+    else:
+        msg = "ℹ️ «Ответственный админ» пишется в БД по пользователю Telegram. Сначала привяжи клиента к TG."
+    await cb.message.answer(msg, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+
+
+@router.callback_query(F.data.startswith("unbound:xui_toggle:"))
+async def unbound_xui_toggle_flow(
+    cb: CallbackQuery,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+):
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
+    parts = cb.data.split(":", 5)
+    if len(parts) < 6:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    action, mode, list_page_s, email = parts[2], parts[3], parts[4], parts[5]
+    if mode not in ("disable", "enable"):
+        return await cb.answer("Ошибка данных", show_alert=True)
+    try:
+        list_page = int(list_page_s)
+    except ValueError:
+        return await cb.answer("Ошибка данных", show_alert=True)
+
+    verb_off = mode == "disable"
+    q = (
+        "Отключить клиента на панели 3X-UI? Только переключатель «вкл/выкл», без удаления и без смены подписки и лимитов."
+        if verb_off
+        else "Включить клиента на панели 3X-UI (только переключатель «вкл»)?"
+    )
+    already = "ℹ️ Клиент на панели уже отключён." if verb_off else "ℹ️ Клиент на панели уже включён."
+    done = "✅ Клиент отключён на панели." if verb_off else "✅ Клиент включён на панели."
+
+    async def _fetch_enabled(em: str) -> bool | None:
+        if os.getenv("MOCK_XUI"):
+            return None
+        try:
+            return await xui_api.get_client_enabled(em)
+        except Exception:
+            LOGGER.exception("unbound.xui_toggle.read_enable")
+            return None
+
+    if action == "ask":
+        await cb.answer()
+        if await _xui_email_bound_in_db(users_repo, email):
+            return await cb.message.answer(
+                f"❌ `{email}` уже в БД — управляй из «Привязанные».",
+                reply_markup=back_admin(),
+            )
+        cur = await _fetch_enabled(email)
+        if cur is not None:
+            if verb_off and not cur:
+                return await cb.message.answer(already, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+            if not verb_off and cur:
+                return await cb.message.answer(already, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Да", callback_data=f"unbound:xui_toggle:yes:{mode}:{list_page}:{email}"
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Нет", callback_data=f"unbound:xui_toggle:no:{mode}:{list_page}:{email}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔙 К карточке клиента",
+                        callback_data=f"unbound:panel:menu:{list_page}:{email}",
+                    )
+                ],
+            ]
+        )
+        return await cb.message.answer(q, reply_markup=kb)
+
+    if action == "yes":
+        await cb.answer()
+        if await _xui_email_bound_in_db(users_repo, email):
+            return await cb.message.answer("❌ Уже привязан в БД.", reply_markup=back_admin())
+        if os.getenv("MOCK_XUI"):
+            return await cb.message.answer(
+                f"✅ MOCK: клиент «{email}» {'отключён' if verb_off else 'включён'}.",
+                reply_markup=_back_to_unbound_panel_kb(email, list_page),
+            )
+        try:
+            iid = await xui_api.find_inbound_id_for_email(email)
+            if verb_off:
+                await xui_api.disable_client(iid, email)
+            else:
+                await xui_api.enable_client(iid, email)
+        except Exception as e:
+            LOGGER.exception("unbound.xui_toggle.apply")
+            return await cb.message.answer(f"❌ {e}", reply_markup=_back_to_unbound_panel_kb(email, list_page))
+        return await cb.message.answer(done, reply_markup=_back_to_unbound_panel_kb(email, list_page))
+
+    if action == "no":
+        await cb.answer("Отменено")
+        return await cb.message.answer("Действие отменено.", reply_markup=_back_to_unbound_panel_kb(email, list_page))
+
+    return await cb.answer("Неизвестное действие", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("unbound:del:ask:"))
 async def unbound_delete_ask(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
-    parts = cb.data.split(":", 3)
-    if len(parts) < 4:
+    parsed = _unbound_page_email(cb.data, 3)
+    if not parsed:
         return await cb.answer("Ошибка данных", show_alert=True)
-    email = parts[3]
+    list_page, email = parsed
     await cb.answer()
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"unbound:del:yes:{email}"),
-                InlineKeyboardButton(text="❌ Отмена", callback_data=f"unbound:panel:menu:{email}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"unbound:panel:menu:{list_page}:{email}"),
             ],
-            [InlineKeyboardButton(text="🔙 К списку", callback_data="admin:unbound:page:0")],
+            [InlineKeyboardButton(text="🔙 К списку", callback_data=f"admin:unbound:page:{list_page}")],
         ]
     )
     await cb.message.answer(
@@ -1284,7 +1658,14 @@ async def unbound_delete_confirm(
 @router.callback_query(F.data.startswith("bind:client:"))
 async def bind_select_client(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
     if not await _is_admin(cb.from_user.id, settings, users_repo): return await cb.answer("🚫", show_alert=True)
-    email = cb.data.split(":", 2)[2]
+    parts = cb.data.split(":", 3)
+    if len(parts) < 4:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    try:
+        list_page = int(parts[2])
+    except ValueError:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    email = parts[3]
     await cb.answer()
     async with aiosqlite.connect(users_repo.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -1294,15 +1675,36 @@ async def bind_select_client(cb: CallbackQuery, settings: Settings, users_repo: 
                ORDER BY COALESCE(created_at, '') DESC, tg_id DESC"""
         ) as cur:
             tg_users = await cur.fetchall()
-    kb = [[InlineKeyboardButton(text=f"👤 {u['username'] or u['first_name'] or 'ID:' + str(u['tg_id'])} ({u['tg_id']})", callback_data=f"bind:do_tg:{u['tg_id']}:{email}")] for u in tg_users[:10]]
-    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin:unbound:page:0")])
+    kb = [
+        [
+            InlineKeyboardButton(
+                text=f"👤 {u['username'] or u['first_name'] or 'ID:' + str(u['tg_id'])} ({u['tg_id']})",
+                callback_data=f"bind:do_tg:{list_page}:{u['tg_id']}:{email}",
+            )
+        ]
+        for u in tg_users[:10]
+    ]
+    kb.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Назад",
+                callback_data=f"unbound:panel:menu:{list_page}:{email}",
+            )
+        ]
+    )
     await cb.message.answer(f"🔗 Привязка `{email}` → TG:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @router.callback_query(F.data.startswith("bind:do_tg:"))
 async def bind_do_tg(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
     if not await _is_admin(cb.from_user.id, settings, users_repo): return await cb.answer("🚫", show_alert=True)
-    parts = cb.data.split(":")
-    tg_id, email = int(parts[2]), parts[3]
+    parts = cb.data.split(":", 4)
+    if len(parts) < 5:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    try:
+        list_page = int(parts[2])
+    except ValueError:
+        return await cb.answer("Ошибка данных", show_alert=True)
+    tg_id, email = int(parts[3]), parts[4]
     await cb.answer()
     try:
         inbounds = await xui_api.get_inbounds()
