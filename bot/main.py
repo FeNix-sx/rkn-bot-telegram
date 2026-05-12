@@ -14,6 +14,14 @@ from bot.router import setup_router
 
 LOGGER = logging.getLogger(__name__)
 
+
+async def _xui_keepalive_loop(xui_api: XUIAPI, interval_seconds: int) -> None:
+    """Тихий опрос API панели и обновление сессии при сбое."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await xui_api.probe_session()
+
+
 async def run(settings) -> None:
     await init_db(settings.db_path)
     LOGGER.info("DB initialized: %s", settings.db_path)
@@ -32,6 +40,14 @@ async def run(settings) -> None:
     except Exception as e:
         LOGGER.warning("3X-UI offline: %s", e)
 
+    keepalive_task: asyncio.Task[None] | None = None
+    if settings.xui_keepalive_seconds > 0:
+        keepalive_task = asyncio.create_task(
+            _xui_keepalive_loop(xui_api, settings.xui_keepalive_seconds),
+            name="xui_keepalive",
+        )
+        LOGGER.info("XUI keepalive every %s s", settings.xui_keepalive_seconds)
+
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=None))
     dp = Dispatcher(storage=MemoryStorage())
 
@@ -47,6 +63,12 @@ async def run(settings) -> None:
         LOGGER.info("Bot started")
         await dp.start_polling(bot)
     finally:
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
         await xui_api.close()
         await bot.session.close()
 
@@ -59,7 +81,10 @@ def main() -> None:
     except ConfigError as e:
         LOGGER.error("Config failed: %s", e)
         raise SystemExit(2)
-    asyncio.run(run(settings))
+    try:
+        asyncio.run(run(settings))
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
 
 if __name__ == "__main__":
     main()

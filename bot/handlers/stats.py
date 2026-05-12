@@ -3,10 +3,17 @@ import logging
 import aiosqlite
 import json
 from datetime import datetime, timezone
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
+from bot.admin_stats_nav import (
+    delete_admin_stats_nav_message_if_any,
+    remember_admin_stats_nav_message,
+    remember_admin_stats_reply_anchor,
+)
 from bot.callback_edit import edit_callback_nav
+from bot.user_message_tidy import try_delete_user_message
+from bot.user_personal_nav import delete_message_pairs, remember_personal_nav_messages, take_personal_nav_batch
 from bot.trial_visibility import user_reply_menu
 from core.xui_api import XUIAPI
 from core.config import Settings
@@ -104,7 +111,6 @@ def _stats_admin_root_kb() -> InlineKeyboardMarkup:
 def _stats_admin_sub_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 К статистике", callback_data="stats:admin:root")],
             [InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")],
         ]
     )
@@ -114,14 +120,34 @@ async def _is_admin_user(tg_id: int, settings: Settings, users_repo: UsersReposi
     return tg_id in settings.admin_ids or await users_repo.is_admin(tg_id)
 
 
-async def _render_admin_stats_menu(msg: Message) -> None:
-    await msg.answer(
+def _remember_stats_nav(cb: CallbackQuery, nav_msg: Message | None) -> None:
+    if cb.from_user and nav_msg:
+        remember_admin_stats_nav_message(cb.from_user.id, nav_msg.chat.id, nav_msg.message_id)
+
+
+async def _render_admin_stats_menu(
+    msg: Message,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+) -> None:
+    tg = msg.from_user
+    if not tg:
+        return
+    row = await users_repo.get_user(tg.id)
+    anchor = await msg.answer(
+        "\u2060",
+        reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api, row=row),
+    )
+    remember_admin_stats_reply_anchor(tg.id, anchor.chat.id, anchor.message_id)
+    sent = await msg.answer(
         "📊 **Статистика**\n\n"
         "• **Пользователи** — есть в боте и указан клиент 3X-UI (статус, ссылка, одобрение и т.д.).\n"
         "• **Клиенты в панели** — только в 3X-UI, к Telegram в боте не привязаны (трафик и параметры клиента в панели).",
         parse_mode="Markdown",
         reply_markup=_stats_admin_root_kb(),
     )
+    remember_admin_stats_nav_message(tg.id, sent.chat.id, sent.message_id)
 
 
 _STAT_PREVIEW_LIMIT = 5
@@ -161,7 +187,7 @@ def _collect_traffic_map(inbounds: list) -> dict[str, tuple[int, int]]:
 
 
 def _stats_admin_paged_kb(branch: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    """Навигация пагинированных страниц админской статистики."""
+    """Только пагинация; выход — через reply-меню (📈 Статистика / ⚙️ Управление и т.д.)."""
     nav: list[InlineKeyboardButton] = []
     if page > 0:
         nav.append(
@@ -175,14 +201,7 @@ def _stats_admin_paged_kb(branch: str, page: int, total_pages: int) -> InlineKey
                 text="➡️", callback_data=f"stats:admin:{branch}:page:{page + 1}"
             )
         )
-
-    inline_keyboard: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text="🔙 К статистике", callback_data="stats:admin:root")],
-    ]
-    if nav:
-        inline_keyboard.append(nav)
-    inline_keyboard.append([InlineKeyboardButton(text="🔙 К управлению", callback_data="admin:main")])
-    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=[nav] if nav else [])
 
 
 async def _collect_unbound_panel_emails(settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI) -> list[str]:
@@ -212,28 +231,54 @@ async def _collect_unbound_panel_emails(settings: Settings, users_repo: UsersRep
 
 
 @router.message(Command("stats"))
-async def stats_command(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def stats_command(
+    msg: Message,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
     tg = msg.from_user
-    if not tg: return
+    if not tg:
+        return
+    await try_delete_user_message(bot, msg)
     is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
     if is_adm:
-        await _render_admin_stats_menu(msg)
+        old = take_personal_nav_batch(tg.id)
+        try:
+            await delete_admin_stats_nav_message_if_any(bot, tg.id)
+            await _render_admin_stats_menu(msg, settings, users_repo, xui_api)
+        finally:
+            await delete_message_pairs(bot, old)
     else:
-        await show_personal_stats(msg, tg.id, settings, users_repo, xui_api)
+        await show_personal_stats(msg, tg.id, settings, users_repo, xui_api, bot)
 
 
 @router.message(F.text == "📈 Статистика")
-async def stats_reply_button(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def stats_reply_button(
+    msg: Message,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
     tg = msg.from_user
-    if not tg: return
-    is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
-    if not is_adm:
-        await msg.answer(
-            "🚫 Нет доступа.",
-            reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api),
-        )
+    if not tg:
         return
-    await _render_admin_stats_menu(msg)
+    await try_delete_user_message(bot, msg)
+    old = take_personal_nav_batch(tg.id)
+    try:
+        is_adm = tg.id in settings.admin_ids or await users_repo.is_admin(tg.id)
+        if not is_adm:
+            await msg.answer(
+                "🚫 Нет доступа.",
+                reply_markup=await user_reply_menu(tg.id, settings, users_repo, xui_api),
+            )
+            return
+        await delete_admin_stats_nav_message_if_any(bot, tg.id)
+        await _render_admin_stats_menu(msg, settings, users_repo, xui_api)
+    finally:
+        await delete_message_pairs(bot, old)
 
 
 @router.callback_query(F.data.startswith("stats:admin:"))
@@ -242,6 +287,7 @@ async def stats_admin_branch(
     settings: Settings,
     users_repo: UsersRepository,
     xui_api: XUIAPI,
+    bot: Bot,
 ):
     if not cb.from_user or not await _is_admin_user(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
@@ -257,102 +303,130 @@ async def stats_admin_branch(
         except ValueError:
             page = 0
     await cb.answer()
-    if mode == "root":
-        return await edit_callback_nav(
-            cb,
-            "📊 **Статистика**\n\n"
-            "• **Пользователи** — есть в боте и указан клиент 3X-UI.\n"
-            "• **Клиенты в панели** — только в 3X-UI, без привязки к Telegram в боте.",
-            _stats_admin_root_kb(),
-            parse_mode="Markdown",
-        )
-    if mode == "users":
-        try:
-            async with aiosqlite.connect(settings.db_path) as db:
-                db.row_factory = aiosqlite.Row
-                async with db.execute("""
-                    SELECT tg_id, username, xui_email, is_admin, approved_by_tg_id, vpn_issued_by_tg_id
-                    FROM users WHERE xui_email IS NOT NULL AND trim(xui_email) != '' ORDER BY tg_id
-                """) as cur:
-                    users = await cur.fetchall()
-            if not users:
-                return await edit_callback_nav(
-                    cb, "📭 Нет пользователей с клиентом в панели.", _stats_admin_sub_kb()
-                )
-            inbounds = await xui_api.get_inbounds()
-            traffic_map = _collect_traffic_map(inbounds)
-            client_info_map = _collect_client_info_map(inbounds)
-            blocks: list[str] = []
-            total = len(users)
-            page_size = _STAT_PREVIEW_LIMIT
-            total_pages = max(1, (total + page_size - 1) // page_size)
-            page = max(0, min(page, total_pages - 1))
-
-            current = users[page * page_size : (page + 1) * page_size]
-            for u in current:
-                email = u["xui_email"]
-                up, down = traffic_map.get(email, (0, 0))
-                info = client_info_map.get(email) or {"limit_ip": 1, "enable": True, "expiry_ms": 0}
-                name = u["username"] or f"ID:{u['tg_id']}"
-                rid = u["tg_id"]
-                role = _role_label(rid, settings, {k: u[k] for k in u.keys()})
-                ap = await _admin_display(users_repo, u["approved_by_tg_id"])
-                vp = await _admin_display(users_repo, u["vpn_issued_by_tg_id"])
-                blocks.append(
-                    _format_stat_block(
-                        name, up, down, info, show_name=True, role_label=role, trial_approver=ap, vpn_issuer=vp
+    old = take_personal_nav_batch(cb.from_user.id) if cb.from_user else []
+    try:
+        if mode == "root":
+            nav_msg = await edit_callback_nav(
+                cb,
+                "📊 **Статистика**\n\n"
+                "• **Пользователи** — есть в боте и указан клиент 3X-UI.\n"
+                "• **Клиенты в панели** — только в 3X-UI, без привязки к Telegram в боте.",
+                _stats_admin_root_kb(),
+                parse_mode="Markdown",
+            )
+            _remember_stats_nav(cb, nav_msg)
+            return
+        if mode == "users":
+            try:
+                async with aiosqlite.connect(settings.db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute("""
+                        SELECT tg_id, username, xui_email, is_admin, approved_by_tg_id, vpn_issued_by_tg_id
+                        FROM users WHERE xui_email IS NOT NULL AND trim(xui_email) != '' ORDER BY tg_id
+                    """) as cur:
+                        users = await cur.fetchall()
+                if not users:
+                    nav_msg = await edit_callback_nav(
+                        cb, "📭 Нет пользователей с клиентом в панели.", _stats_admin_sub_kb()
                     )
-                )
-            head = f"📊 **Пользователи** (стр. {page + 1}/{total_pages}, всего {total}):\n\n"
-            text = head + "\n\n──────────────\n\n".join(blocks)
-            kb = _stats_admin_paged_kb("users", page, total_pages)
-            return await edit_callback_nav(cb, text, kb, parse_mode="Markdown")
-        except Exception as e:
-            LOGGER.exception("stats.admin.users.error")
-            return await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
-    if mode == "panel":
-        try:
-            emails = await _collect_unbound_panel_emails(settings, users_repo, xui_api)
-            if not emails:
-                return await edit_callback_nav(
-                    cb,
-                    "📭 Нет клиентов в панели без привязки к пользователю бота.",
-                    _stats_admin_sub_kb(),
-                )
-            inbounds = await xui_api.get_inbounds()
-            traffic_map = _collect_traffic_map(inbounds)
-            client_info_map = _collect_client_info_map(inbounds)
-            blocks: list[str] = []
-            total = len(emails)
-            page_size = _STAT_PREVIEW_LIMIT
-            total_pages = max(1, (total + page_size - 1) // page_size)
-            page = max(0, min(page, total_pages - 1))
+                    _remember_stats_nav(cb, nav_msg)
+                    return
+                inbounds = await xui_api.get_inbounds()
+                traffic_map = _collect_traffic_map(inbounds)
+                client_info_map = _collect_client_info_map(inbounds)
+                blocks: list[str] = []
+                total = len(users)
+                page_size = _STAT_PREVIEW_LIMIT
+                total_pages = max(1, (total + page_size - 1) // page_size)
+                page = max(0, min(page, total_pages - 1))
 
-            current = emails[page * page_size : (page + 1) * page_size]
-            for email in current:
-                up, down = traffic_map.get(email, (0, 0))
-                info = client_info_map.get(email) or {"limit_ip": 1, "enable": True, "expiry_ms": 0}
-                blocks.append(_format_stat_block(email, up, down, info, show_name=True))
-            head = f"📊 **Клиенты в панели** (стр. {page + 1}/{total_pages}, всего {total}):\n\n"
-            text = head + "\n\n──────────────\n\n".join(blocks)
-            kb = _stats_admin_paged_kb("panel", page, total_pages)
-            return await edit_callback_nav(cb, text, kb, parse_mode="Markdown")
-        except Exception as e:
-            LOGGER.exception("stats.admin.panel.error")
-            return await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
-    return await cb.answer("Неизвестно", show_alert=True)
+                current = users[page * page_size : (page + 1) * page_size]
+                for u in current:
+                    email = u["xui_email"]
+                    up, down = traffic_map.get(email, (0, 0))
+                    info = client_info_map.get(email) or {"limit_ip": 1, "enable": True, "expiry_ms": 0}
+                    name = u["username"] or f"ID:{u['tg_id']}"
+                    rid = u["tg_id"]
+                    role = _role_label(rid, settings, {k: u[k] for k in u.keys()})
+                    ap = await _admin_display(users_repo, u["approved_by_tg_id"])
+                    vp = await _admin_display(users_repo, u["vpn_issued_by_tg_id"])
+                    blocks.append(
+                        _format_stat_block(
+                            name, up, down, info, show_name=True, role_label=role, trial_approver=ap, vpn_issuer=vp
+                        )
+                    )
+                head = f"📊 **Пользователи** (стр. {page + 1}/{total_pages}, всего {total}):\n\n"
+                text = head + "\n\n──────────────\n\n".join(blocks)
+                kb = _stats_admin_paged_kb("users", page, total_pages)
+                nav_msg = await edit_callback_nav(cb, text, kb, parse_mode="Markdown")
+                _remember_stats_nav(cb, nav_msg)
+                return
+            except Exception as e:
+                LOGGER.exception("stats.admin.users.error")
+                nav_msg = await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
+                _remember_stats_nav(cb, nav_msg)
+                return
+        if mode == "panel":
+            try:
+                emails = await _collect_unbound_panel_emails(settings, users_repo, xui_api)
+                if not emails:
+                    nav_msg = await edit_callback_nav(
+                        cb,
+                        "📭 Нет клиентов в панели без привязки к пользователю бота.",
+                        _stats_admin_sub_kb(),
+                    )
+                    _remember_stats_nav(cb, nav_msg)
+                    return
+                inbounds = await xui_api.get_inbounds()
+                traffic_map = _collect_traffic_map(inbounds)
+                client_info_map = _collect_client_info_map(inbounds)
+                blocks: list[str] = []
+                total = len(emails)
+                page_size = _STAT_PREVIEW_LIMIT
+                total_pages = max(1, (total + page_size - 1) // page_size)
+                page = max(0, min(page, total_pages - 1))
+
+                current = emails[page * page_size : (page + 1) * page_size]
+                for email in current:
+                    up, down = traffic_map.get(email, (0, 0))
+                    info = client_info_map.get(email) or {"limit_ip": 1, "enable": True, "expiry_ms": 0}
+                    blocks.append(_format_stat_block(email, up, down, info, show_name=True))
+                head = f"📊 **Клиенты в панели** (стр. {page + 1}/{total_pages}, всего {total}):\n\n"
+                text = head + "\n\n──────────────\n\n".join(blocks)
+                kb = _stats_admin_paged_kb("panel", page, total_pages)
+                nav_msg = await edit_callback_nav(cb, text, kb, parse_mode="Markdown")
+                _remember_stats_nav(cb, nav_msg)
+                return
+            except Exception as e:
+                LOGGER.exception("stats.admin.panel.error")
+                nav_msg = await edit_callback_nav(cb, f"❌ {type(e).__name__}", _stats_admin_sub_kb())
+                _remember_stats_nav(cb, nav_msg)
+                return
+        return await cb.answer("Неизвестно", show_alert=True)
+    finally:
+        await delete_message_pairs(bot, old)
 
 
-async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
+async def show_personal_stats(
+    msg: Message,
+    tg_id: int,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
+    old = take_personal_nav_batch(tg_id)
     try:
         row = await users_repo.get_user(tg_id)
         role = _role_label(tg_id, settings, row)
         if not row or not row.get("xui_email"):
-            return await msg.answer(
+            sent = await msg.answer(
                 f"🔍 Профиль не привязан к панели.\n🔑 Полномочия: `{role}`",
                 parse_mode="Markdown",
                 reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row),
             )
+            remember_personal_nav_messages(tg_id, [sent])
+            return
 
         email = row["xui_email"]
         inbounds = await xui_api.get_inbounds()
@@ -366,16 +440,19 @@ async def show_personal_stats(msg: Message, tg_id: int, settings: Settings, user
         text = _format_stat_block(
             None, up, down, info, show_name=False, role_label=role, trial_approver=ap, vpn_issuer=vp
         )
-        await msg.answer(
+        sent = await msg.answer(
             text,
             parse_mode="Markdown",
             reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row),
         )
+        remember_personal_nav_messages(tg_id, [sent])
     except Exception as e:
         LOGGER.exception("stats.personal.error")
         row_e = await users_repo.get_user(tg_id)
-        await msg.answer(
+        sent = await msg.answer(
             f"❌ Ошибка: {type(e).__name__}",
             reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row_e),
         )
-
+        remember_personal_nav_messages(tg_id, [sent])
+    finally:
+        await delete_message_pairs(bot, old)

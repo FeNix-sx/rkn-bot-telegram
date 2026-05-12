@@ -1,5 +1,6 @@
 """Minimal async 3x-ui API client."""
 from __future__ import annotations
+import asyncio
 import copy
 import json
 import logging
@@ -45,11 +46,12 @@ class XUIAPI:
             follow_redirects=True,
         )
         self._is_ready = False
+        self._auth_lock = asyncio.Lock()
 
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def login(self) -> None:
+    async def _login_unlocked(self) -> None:
         LOGGER.info("xui.login.start")
         resp = await self._client.post(
             "/login",
@@ -61,6 +63,10 @@ class XUIAPI:
             raise XUIAPIError(f"Auth failed: {payload.get('msg')}")
         self._is_ready = True
         LOGGER.info("xui.login.ok")
+
+    async def login(self) -> None:
+        async with self._auth_lock:
+            await self._login_unlocked()
 
     async def _request(
         self,
@@ -101,6 +107,18 @@ class XUIAPI:
                 LOGGER.warning("xui.request.retry", extra={"path": path, "attempt": attempt})
             except json.JSONDecodeError as exc:
                 raise XUIAPIError(f"Invalid JSON from 3x-ui on {path}.") from exc
+
+    async def probe_session(self) -> None:
+        """Лёгкий опрос панели; при любой ошибке — тихий повторный login."""
+        try:
+            await self.get_inbounds()
+        except Exception as exc:
+            LOGGER.warning("xui.keepalive.probe_failed: %s", exc)
+            self._is_ready = False
+            try:
+                await self.login()
+            except Exception as exc2:
+                LOGGER.warning("xui.keepalive.relogin_failed: %s", exc2)
 
     async def get_inbounds(self) -> list[dict[str, Any]]:
         # ТВОЯ СБОРКА ТРЕБУЕТ /list

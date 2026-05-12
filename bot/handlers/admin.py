@@ -9,6 +9,7 @@ from datetime import datetime, time, timezone, timedelta
 from uuid import uuid4
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, User
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -18,12 +19,27 @@ from core.xui_api import XUIAPI, XUIAPIError
 from core.config import Settings
 from db.repositories.users_repo import UsersRepository
 from db.database import utc_now_iso
+from bot.admin_stats_nav import (
+    delete_admin_stats_nav_message_if_any,
+    forget_admin_stats_nav_message,
+    pop_delete_admin_reply_anchor_if_any,
+    remember_admin_stats_reply_anchor,
+)
 from bot.callback_edit import edit_callback_nav
-from bot.handlers.user import PENDING_TRIALS, PENDING_NEW_USERS, _issue_trial_now
+from bot.user_message_tidy import try_delete_user_message
+from bot.user_personal_nav import delete_message_pairs, take_personal_nav_batch
+from bot.handlers.user import PENDING_TRIALS, PENDING_NEW_USERS, _issue_trial_now, dismiss_admin_pending_notices
 from bot.handlers.stats import _admin_display, _get_client_info, _gb
 
 LOGGER = logging.getLogger(__name__)
 router = Router()
+
+
+async def _try_delete_message(bot: Bot, chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except TelegramBadRequest:
+        pass
 
 
 class AdminRenew(StatesGroup):
@@ -334,21 +350,65 @@ async def _xui_email_bound_in_db(users_repo: UsersRepository, email: str) -> boo
 
 
 @router.message(F.text == "⚙️ Управление")
-async def admin_main(msg: Message, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI):
-    if not await _is_admin(msg.from_user.id, settings, users_repo):
-        uid = msg.from_user.id if msg.from_user else 0
-        return await msg.answer(
-            "🚫",
-            reply_markup=await user_reply_menu(uid, settings, users_repo, xui_api),
+async def admin_main(
+    msg: Message,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
+    if not msg.from_user:
+        return
+    await try_delete_user_message(bot, msg)
+    old = take_personal_nav_batch(msg.from_user.id)
+    try:
+        if not await _is_admin(msg.from_user.id, settings, users_repo):
+            uid = msg.from_user.id
+            return await msg.answer(
+                "🚫",
+                reply_markup=await user_reply_menu(uid, settings, users_repo, xui_api),
+            )
+        await delete_admin_stats_nav_message_if_any(bot, msg.from_user.id)
+        rid = msg.from_user.id
+        await msg.answer(
+            "⚙️ Управление:",
+            reply_markup=admin_menu(),
         )
-    await msg.answer("⚙️ Управление:", reply_markup=admin_menu())
+        await msg.answer(
+            "\u2060",
+            reply_markup=await user_reply_menu(rid, settings, users_repo, xui_api),
+        )
+    finally:
+        await delete_message_pairs(bot, old)
 
 @router.callback_query(F.data == "admin:main")
-async def admin_main_cb(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository):
+async def admin_main_cb(
+    cb: CallbackQuery,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
     await cb.answer()
-    await _edit_admin_nav(cb, "⚙️ Управление:", admin_menu())
+    old = take_personal_nav_batch(cb.from_user.id) if cb.from_user else []
+    try:
+        if cb.from_user:
+            await pop_delete_admin_reply_anchor_if_any(bot, cb.from_user.id)
+        await _edit_admin_nav(cb, "⚙️ Управление:", admin_menu())
+        if cb.from_user:
+            forget_admin_stats_nav_message(cb.from_user.id)
+            if cb.message:
+                m = await cb.message.answer(
+                    "\u2060",
+                    reply_markup=await user_reply_menu(
+                        cb.from_user.id, settings, users_repo, xui_api
+                    ),
+                )
+                remember_admin_stats_reply_anchor(cb.from_user.id, m.chat.id, m.message_id)
+    finally:
+        await delete_message_pairs(bot, old)
 
 
 @router.callback_query(F.data == "admin:panel_back")
@@ -1061,8 +1121,7 @@ async def bound_delete_confirm(
         return await _edit_admin_nav(cb, f"❌ БД: {e}", back_admin())
     if not deleted:
         return await _edit_admin_nav(cb, "❌ Строка в БД не удалена (гонка?).", back_admin())
-    PENDING_NEW_USERS.pop(tg_id, None)
-    PENDING_TRIALS.pop(tg_id, None)
+    await dismiss_admin_pending_notices(bot, tg_id)
     note = (
         f"🗑 Пользователь `{tg_id}` удалён из БД бота."
         + (f"\nКлиент панели `{email}` удалён из 3X-UI." if email and not os.getenv("MOCK_XUI") else "")
@@ -1184,12 +1243,35 @@ async def xui_add_db_start(
 
 
 @router.callback_query(F.data == "xui:add:cancel")
-async def xui_add_cancel(cb: CallbackQuery, state: FSMContext, settings: Settings, users_repo: UsersRepository):
+async def xui_add_cancel(
+    cb: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    users_repo: UsersRepository,
+    xui_api: XUIAPI,
+    bot: Bot,
+):
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
     await state.clear()
     await cb.answer("Отменено")
-    await _edit_admin_nav(cb, "⚙️ Управление:", admin_menu())
+    old = take_personal_nav_batch(cb.from_user.id) if cb.from_user else []
+    try:
+        if cb.from_user:
+            await pop_delete_admin_reply_anchor_if_any(bot, cb.from_user.id)
+        await _edit_admin_nav(cb, "⚙️ Управление:", admin_menu())
+        if cb.from_user:
+            forget_admin_stats_nav_message(cb.from_user.id)
+            if cb.message:
+                m = await cb.message.answer(
+                    "\u2060",
+                    reply_markup=await user_reply_menu(
+                        cb.from_user.id, settings, users_repo, xui_api
+                    ),
+                )
+                remember_admin_stats_reply_anchor(cb.from_user.id, m.chat.id, m.message_id)
+    finally:
+        await delete_message_pairs(bot, old)
 
 
 @router.message(StateFilter(XuiAddClient.waiting_email), F.text)
@@ -1998,8 +2080,13 @@ async def start_approve(cb: CallbackQuery, settings: Settings, users_repo: Users
     tg_id = int(cb.data.split(":")[2])
     pending = PENDING_NEW_USERS.pop(tg_id, None)
     if not pending:
-        return await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+        await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+        if cb.message:
+            await _try_delete_message(bot, cb.message.chat.id, cb.message.message_id)
+        return
+    notices = list(pending.get("admin_notices") or ())
     await cb.answer("✅ Добавлен")
+    await delete_message_pairs(bot, notices)
     await users_repo.create_user_if_not_exists(
         tg_id,
         pending.get("username"),
@@ -2015,7 +2102,12 @@ async def start_approve(cb: CallbackQuery, settings: Settings, users_repo: Users
         )
     except Exception:
         LOGGER.exception("start.approve.notify_user")
-    await cb.message.answer(f"✅ Пользователь добавлен в БД: `{tg_id}`")
+    aid = cb.from_user.id if cb.from_user else None
+    if aid:
+        try:
+            await bot.send_message(aid, f"✅ Пользователь добавлен в БД: `{tg_id}`")
+        except Exception:
+            LOGGER.debug("start.approve.admin_confirm", exc_info=True)
 
 
 @router.callback_query(F.data.startswith("start:deny:"))
@@ -2023,24 +2115,42 @@ async def start_deny(cb: CallbackQuery, settings: Settings, users_repo: UsersRep
     if not await _is_admin(cb.from_user.id, settings, users_repo):
         return await cb.answer("🚫", show_alert=True)
     tg_id = int(cb.data.split(":")[2])
-    if not PENDING_NEW_USERS.pop(tg_id, None):
-        return await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+    pending = PENDING_NEW_USERS.pop(tg_id, None)
+    if not pending:
+        await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+        if cb.message:
+            await _try_delete_message(bot, cb.message.chat.id, cb.message.message_id)
+        return
+    notices = list(pending.get("admin_notices") or ())
     await cb.answer("Отклонено")
+    await delete_message_pairs(bot, notices)
     try:
         await bot.send_message(tg_id, "❌ В доступе отказано.", reply_markup=reply_menu(False, show_trial=False))
     except Exception:
         LOGGER.exception("start.deny.notify_user")
-    await cb.message.answer(f"❌ Доступ отклонён: `{tg_id}`")
+    aid = cb.from_user.id if cb.from_user else None
+    if aid:
+        try:
+            await bot.send_message(aid, f"❌ Доступ отклонён: `{tg_id}`")
+        except Exception:
+            LOGGER.debug("start.deny.admin_confirm", exc_info=True)
 
 
 # === ОДОБРЕНИЕ / ОТКЛОНЕНИЕ ТРИАЛА ===
 @router.callback_query(F.data.startswith("trial:approve:"))
 async def trial_approve(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI, bot: Bot):
-    if not await _is_admin(cb.from_user.id, settings, users_repo): return await cb.answer("🚫", show_alert=True)
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
     tg_id = int(cb.data.split(":")[2])
     req = PENDING_TRIALS.pop(tg_id, None)
-    if not req: return await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+    if not req:
+        await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+        if cb.message:
+            await _try_delete_message(bot, cb.message.chat.id, cb.message.message_id)
+        return
+    notices = list(req.get("admin_notices") or ())
     await cb.answer("✅ Одобрено")
+    await delete_message_pairs(bot, notices)
     try:
         approver = cb.from_user.id if cb.from_user else None
         await users_repo.set_trial_approved_by(tg_id, approver)
@@ -2061,12 +2171,21 @@ async def trial_approve(cb: CallbackQuery, settings: Settings, users_repo: Users
             reply_markup=await user_reply_menu(tg_id, settings, users_repo, xui_api, row=row_u),
         )
 
+
 @router.callback_query(F.data.startswith("trial:deny:"))
 async def trial_deny(cb: CallbackQuery, settings: Settings, users_repo: UsersRepository, xui_api: XUIAPI, bot: Bot):
-    if not await _is_admin(cb.from_user.id, settings, users_repo): return await cb.answer("🚫", show_alert=True)
+    if not await _is_admin(cb.from_user.id, settings, users_repo):
+        return await cb.answer("🚫", show_alert=True)
     tg_id = int(cb.data.split(":")[2])
-    if not PENDING_TRIALS.pop(tg_id, None): return await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+    req = PENDING_TRIALS.pop(tg_id, None)
+    if not req:
+        await cb.answer("⚠️ Запрос уже обработан", show_alert=True)
+        if cb.message:
+            await _try_delete_message(bot, cb.message.chat.id, cb.message.message_id)
+        return
+    notices = list(req.get("admin_notices") or ())
     await cb.answer("❌ Отклонено")
+    await delete_message_pairs(bot, notices)
     row_u = await users_repo.get_user(tg_id)
     await bot.send_message(
         tg_id,

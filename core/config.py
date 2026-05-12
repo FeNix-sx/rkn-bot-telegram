@@ -31,6 +31,7 @@ class Settings:
     admin_ids: tuple[int, ...]
     trial_days: int
     db_path: str
+    xui_keepalive_seconds: int
 
 def _load_dotenv_file(env_path: Path) -> None:
     """Подставляет переменные из файла в os.environ (перезапись), иначе setdefault
@@ -79,6 +80,18 @@ def _xui_vless_host() -> str | None:
     v = os.getenv("XUI_VLESS_HOST", "").strip()
     return v if v else None
 
+
+def _xui_keepalive_seconds() -> int:
+    """Интервал тихого опроса панели (сек). 0 — выключено. По умолчанию 3600."""
+    v = os.getenv("XUI_KEEPALIVE_SECONDS", "").strip()
+    if not v:
+        return 3600
+    try:
+        n = int(v)
+    except ValueError:
+        return 3600
+    return max(0, n)
+
 def _resolve_env_path(env_file: str | Path) -> Path:
     p = Path(env_file)
     return p if p.is_absolute() else _PROJECT_ROOT / p
@@ -106,4 +119,5 @@ def load_settings(env_file: str | Path = ".env") -> Settings:
         admin_ids=_parse_admin_ids(_require_non_empty("ADMIN_IDS")),
         trial_days=_parse_trial_days(_require_non_empty("TRIAL_DAYS")),
         db_path=_require_non_empty("DB_PATH"),
+        xui_keepalive_seconds=_xui_keepalive_seconds(),
     )
